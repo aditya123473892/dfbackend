@@ -1,0 +1,453 @@
+AI FEATURE ADDITION AND APPLICATION ISSUES REPORT
+Project: Dark Fantasy Backend
+Date: 05/08/2026
+
+============================================================
+1. FEATURE SUMMARY
+============================================================
+
+Requirement:
+Add an AI assistant to the existing chat system so users and groups can still get responses when admins are not active or not available.
+
+Main idea:
+The AI will work like a fallback admin. When no real admin is online, the AI will reply to direct user messages. For group messages, the AI should reply only when mentioned or when group AI support is enabled.
+
+Recommended AI name:
+Dark Fantasy Assistant
+
+Recommended first version:
+Start with direct user-to-admin chat only. After that is stable, add group chat replies.
+
+
+============================================================
+2. WHY THIS FEATURE IS NEEDED
+============================================================
+
+Current problem:
+If admins are offline, users may send messages but receive no response. This can make the software look inactive or abandoned.
+
+Expected benefit:
+- Users get immediate replies even when admins are offline.
+- Admin workload is reduced.
+- The app feels active 24/7.
+- Common questions can be answered automatically.
+- Admins can take over later when they come online.
+
+
+============================================================
+3. PROPOSED AI BEHAVIOR
+============================================================
+
+Direct user messages:
+- User sends message to admin.
+- Backend checks if any real admin is online.
+- If admin is online, AI does not reply.
+- If no admin is online, AI replies as fallback support.
+- AI reply is saved in ChatMessages collection.
+- AI reply is emitted to the user using existing socket event receiveMessage.
+
+Group messages:
+- User sends group message.
+- AI should reply only if the message contains a mention like @ai, @admin, or @assistant.
+- AI should not reply to every group message by default.
+- AI group reply is saved in ChatMessages collection with groupId.
+- AI reply is emitted using existing receiveGroupMessage socket event.
+
+Admin handoff:
+- When admin comes online, AI should stop automatic replies.
+- User should be able to continue conversation with real admin.
+- AI should clearly say it is an automated assistant, not a human admin.
+
+
+============================================================
+4. TECHNICAL IMPLEMENTATION PROCESS
+============================================================
+
+Step 1: Add environment variables
+
+Add these to .env and .env.development:
+
+OPENAI_API_KEY=
+OPENAI_MODEL=gpt-4.1-mini
+AI_ADMIN_ENABLED=true
+AI_GROUP_REPLY_ENABLED=true
+AI_ADMIN_USER_ID=
+AI_RESPONSE_DELAY_MS=1200
+AI_COOLDOWN_SECONDS=20
+
+Purpose:
+- OPENAI_API_KEY: OpenAI API key.
+- OPENAI_MODEL: Model used for AI replies.
+- AI_ADMIN_ENABLED: Enable or disable direct chat AI.
+- AI_GROUP_REPLY_ENABLED: Enable or disable group chat AI.
+- AI_ADMIN_USER_ID: MongoDB user id of AI assistant user.
+- AI_RESPONSE_DELAY_MS: Small delay to make reply feel natural.
+- AI_COOLDOWN_SECONDS: Prevent too many AI replies.
+
+
+Step 2: Install OpenAI SDK
+
+Command:
+npm install openai
+
+
+Step 3: Create AI assistant user
+
+Create one system user in Users collection:
+
+displayname: Dark Fantasy Assistant
+username: ai-assistant@darkfantasy.local
+roles: admin
+isAi: true
+isBlocked: false
+isOnline: true
+
+Recommended schema update:
+Add isAi boolean field in users.schema.ts.
+
+
+Step 4: Create AI module and service
+
+Create files:
+
+src/ai/ai.module.ts
+src/ai/ai.service.ts
+
+AI service responsibilities:
+- Receive user message.
+- Fetch recent chat context.
+- Create system prompt.
+- Call OpenAI API.
+- Return short, safe response.
+- Avoid responding to itself.
+- Apply cooldown.
+- Return fallback message if OpenAI fails.
+
+
+Step 5: Add direct chat integration
+
+Modify:
+src/chats/chats.gateway.ts
+
+Current direct message flow:
+sendMessage -> save message -> emit receiveMessage
+
+New flow:
+sendMessage -> save user message -> check admin online status -> if no admin online, generate AI response -> save AI response -> emit receiveMessage
+
+
+Step 6: Add group chat integration
+
+Modify:
+src/chats/chats.gateway.ts
+
+Current group message flow:
+sendGroupMessage -> save group message -> emit receiveGroupMessage
+
+New flow:
+sendGroupMessage -> save group message -> check if AI should respond -> generate AI response -> save AI response -> emit receiveGroupMessage
+
+AI should respond in group only when:
+- AI_GROUP_REPLY_ENABLED=true
+- message includes @ai, @admin, or @assistant
+- sender is not AI
+- cooldown has passed
+
+
+Step 7: Add safety controls
+
+Required safety controls:
+- Do not respond to AI's own messages.
+- Do not respond if message is empty.
+- Do not respond if AI is disabled.
+- Add cooldown per user and per group.
+- Limit response length.
+- Log AI errors clearly.
+- Do not expose OpenAI errors to users.
+- AI must not pretend to be a human admin.
+
+
+Step 8: Store AI messages
+
+Direct AI message example:
+
+sender: AI_ADMIN_USER_ID
+receiver: originalUserId
+message: aiText
+type: ai
+
+Group AI message example:
+
+sender: AI_ADMIN_USER_ID
+groupId: groupId
+message: aiText
+type: group-ai
+
+
+Step 9: Test the feature
+
+Test cases:
+- User sends message when admin is online. AI should not reply.
+- User sends message when admin is offline. AI should reply.
+- AI reply should appear in chat history.
+- AI reply should emit through socket.
+- AI should not reply to itself.
+- AI should not reply if receiver id is invalid.
+- Group message without mention should not trigger AI.
+- Group message with @ai should trigger AI.
+- Cooldown should prevent spam.
+- OpenAI API failure should return fallback message or no reply.
+
+
+============================================================
+5. ESTIMATED TIMELINE
+============================================================
+
+MVP version:
+Direct user-to-admin AI fallback only.
+Estimated time: 1.5 to 2 working days.
+
+Full version:
+Direct chat AI + group chat AI + cooldown + handoff + testing.
+Estimated time: 4 to 5 working days.
+
+Detailed timeline:
+
+Day 1:
+- Review current chat gateway and admin online logic.
+- Add env variables.
+- Create AI assistant user.
+- Install OpenAI SDK.
+- Create AI module and service.
+
+Estimated time: 4 to 6 hours.
+
+Day 2:
+- Connect AI service to direct chat.
+- Save AI replies in ChatMessages.
+- Emit AI replies with receiveMessage.
+- Add basic cooldown and no-self-reply protection.
+
+Estimated time: 6 to 8 hours.
+
+Day 3:
+- Add group chat AI support.
+- Reply only on @ai, @admin, or @assistant mention.
+- Save group AI replies.
+- Emit receiveGroupMessage.
+
+Estimated time: 5 to 7 hours.
+
+Day 4:
+- Add admin handoff rules.
+- Improve logging.
+- Add fallback responses.
+- Test with real socket clients.
+
+Estimated time: 5 to 6 hours.
+
+Day 5:
+- Final testing.
+- Fix edge cases.
+- Verify production build.
+- Prepare deployment notes.
+
+Estimated time: 4 to 6 hours.
+
+
+============================================================
+6. CURRENT APPLICATION ISSUES FOUND
+============================================================
+
+Issue 1: Chat receiver can become undefined
+
+Evidence:
+Some ChatMessages records had receiver value as "undefined".
+
+Impact:
+- Messages can be saved with invalid receiver.
+- Receiver will not get message.
+- Chat history and unread counts may break.
+
+Status:
+Backend validation was added to reject invalid sender and receiver ids.
+
+Recommended frontend fix:
+When sending message, use selectedUser._id or post.user._id as receiver.
+
+
+Issue 2: Production cannot resolve src imports
+
+Evidence:
+Runtime error:
+Cannot find module 'src/users/users.service'
+
+Cause:
+TypeScript can compile src/... imports because of baseUrl, but Node cannot resolve them in dist without alias support.
+
+Status:
+Runtime path resolver was added.
+package.json start:prod was updated.
+
+
+Issue 3: S3 bucket env missing
+
+Evidence:
+AWS error:
+Missing required key 'Bucket' in params
+
+Cause:
+AWS_DEFAULT_S3_BUCKET was missing from env files.
+
+Status:
+AWS_DEFAULT_S3_BUCKET=dark-fantacy-dev was added to .env and .env.development.
+
+Still required:
+AWS_ACCESS_KEY
+AWS_SECRET
+AWS_S3_REGION
+
+
+Issue 4: Post signed URLs were not saved
+
+Cause:
+ImageURLService generated refreshed post media URLs but updateOne call was commented out.
+
+Impact:
+Post URLs may expire and not refresh in database.
+
+Status:
+Post media update was enabled.
+
+
+Issue 5: Chat socket trusts sender id from client
+
+Current risk:
+Client sends sender id in socket payload.
+
+Impact:
+A malicious user could pretend to send messages as another user.
+
+Recommended fix:
+Authenticate socket connection using JWT and derive sender id from token instead of request body.
+
+
+Issue 6: Admin online status may be unreliable
+
+Current behavior:
+Online status depends on socket connection and disconnect events.
+
+Risk:
+If server restarts or socket disconnect is missed, admin status can be wrong.
+
+Recommended fix:
+Add heartbeat or lastSeen validation.
+Treat admin as offline if lastSeen is older than a configured threshold.
+
+
+Issue 7: No message rate limiting
+
+Risk:
+Users can send many messages quickly.
+
+Impact:
+- Spam.
+- Database load.
+- High AI cost after AI integration.
+
+Recommended fix:
+Add rate limit per user for socket messages.
+
+
+Issue 8: AI cost control needed
+
+Risk:
+If AI replies to every message, cost can increase quickly.
+
+Required controls:
+- Cooldown.
+- Daily AI reply limit.
+- Max tokens.
+- Disable flags.
+- Only group reply on mention.
+
+
+Issue 9: Node version mismatch
+
+package.json says:
+Node 18.18.1
+
+Runtime log showed:
+Node 24.11.0
+
+Impact:
+Unexpected dependency behavior may happen.
+
+Recommended fix:
+Use Node 18 LTS or update and test dependencies for Node 24.
+
+
+Issue 10: Empty catch blocks and noisy logs
+
+Problem:
+Some backend jobs silently ignore errors or log full AWS stack traces repeatedly.
+
+Impact:
+Hard to debug production issues.
+
+Status:
+S3 logs were cleaned up and ImageURLService now logs event refresh failures clearly.
+
+
+============================================================
+7. RECOMMENDED MVP SCOPE
+============================================================
+
+Phase 1 MVP:
+- AI replies only to direct messages sent to admin.
+- AI replies only when no real admin is online.
+- AI response saved in ChatMessages.
+- AI response emitted using receiveMessage.
+- Add cooldown.
+- Add AI enable/disable env flag.
+- Add basic logs.
+
+Do not include in MVP:
+- AI for every group message.
+- Complex admin dashboard.
+- Training/custom knowledge base.
+- Payment/subscription based AI limits.
+
+
+============================================================
+8. PHASE 2 IMPROVEMENTS
+============================================================
+
+After MVP:
+- Add AI replies in group chat.
+- Add group-level AI enable/disable setting.
+- Add admin dashboard toggle.
+- Add AI conversation summaries for admins.
+- Add knowledge base from FAQs or policies.
+- Add escalation tagging for messages needing human admin.
+- Add analytics for AI usage and unresolved questions.
+
+
+============================================================
+9. FINAL RECOMMENDATION
+============================================================
+
+Implement the AI assistant in two phases.
+
+Phase 1:
+Direct offline-admin AI fallback.
+Timeline: 1.5 to 2 days.
+
+Phase 2:
+Group chat AI, admin controls, reporting, and stronger safety.
+Timeline: 2 to 3 more days.
+
+Total recommended timeline:
+4 to 5 working days.
+
+This approach gives the app the biggest benefit quickly while keeping risk, cost, and complexity under control.

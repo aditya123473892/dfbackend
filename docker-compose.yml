@@ -1,0 +1,28 @@
+version: '3.8'
+
+services:
+  nest-app:
+    build: .
+    container_name: nest-app-container
+    restart: always
+    env_file:
+      - .env  # Load environment variables from .env file
+    depends_on:
+      - mongo-db
+    ports:
+      - "9000:9000"
+
+  mongo-db:
+    image: mongo:6
+    restart: always
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: root
+      MONGO_INITDB_ROOT_PASSWORD: password
+      MONGO_INITDB_DATABASE: darkfantasy
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongo_data:/data/db
+
+volumes:
+  mongo_data:
