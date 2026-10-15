@@ -10,7 +10,7 @@ import { UpdateUserProfileDto } from './dtos/update-user-profile.dto';
 import { UserEditHistory } from 'src/common/schemas/user-profile-edit.schema';
 import { ApproveUserRequestDto } from './dtos/approve-request.dto';
 import { Follow, FollowStatus } from 'src/common/schemas/follow.schema';
-import { EPostVisibility } from 'src/common/enums/posts.enum';
+import { EPostStatus, EPostVisibility } from 'src/common/enums/posts.enum';
 import {
   PostRequest,
   PostRequestDocument,
@@ -23,6 +23,55 @@ import {
   ChatMessage, 
   ChatMessageDocument
 } from 'src/common/schemas/chats.schema';
+import { anyId } from 'src/chats/chats.service';
+
+// Never returned by any user endpoint.
+const SECRET_FIELDS = [
+  'password',
+  'passwordResetToken',
+  'passwordResetTokenUsed',
+  'verifyEmailToken',
+  'loginAttempts',
+];
+// Returned only to the account itself and to admins.
+const PRIVATE_FIELDS = [
+  'username',
+  'phoneNumber',
+  'loginCount',
+  'lastLogin',
+  'blockedBy',
+  'blockedTime',
+  'canEditProfile',
+];
+// What a user may change on their own profile through PATCH /users/me.
+export const SELF_EDITABLE_FIELDS = [
+  'displayname',
+  'firstName',
+  'lastName',
+  'bio',
+  'intrests',
+  'gender',
+  'age',
+  'phoneNumber',
+  'city',
+  'state',
+  'country',
+];
+
+const escapeRegex = (value: string) => value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+const searchPattern = (value: string) =>
+  new RegExp(escapeRegex(String(value).slice(0, 100)).replace(/\s+/g, '\\s+'), 'i');
+
+/** Strips secrets always, and contact/account details unless self or admin. */
+export function toUserResponse(user: any, viewer?: { id?: string; roles?: string[] }) {
+  if (!user) return user;
+  const source = user.toObject ? user.toObject() : { ...user };
+  const self = !!viewer?.id && String(source._id) === String(viewer.id);
+  const admin = !!viewer?.roles?.some((role) => role === ERole.ADMIN || role === ERole.ROOT);
+  for (const field of SECRET_FIELDS) delete source[field];
+  if (!self && !admin) for (const field of PRIVATE_FIELDS) delete source[field];
+  return source;
+}
 
 @Injectable()
 export class UsersService {
@@ -73,30 +122,26 @@ export class UsersService {
   async findAll(params: FilterUsersDto) {
     const query = this.usersModel.find();
 
-    // Apply search condition based on ownerType
+    // Search input is escaped: it is matched literally, never as a pattern.
     if (params.name) {
-      const regex = new RegExp(params.name.replace(/\s+/g, '\\s+'), 'i');
-      query.where('name').equals(regex);
+      const regex = searchPattern(params.name);
+      query.or([{ displayname: regex }, { firstName: regex }, { lastName: regex }]);
     }
 
     if (params.displayname) {
-      const regex = new RegExp(params.displayname.replace(/\s+/g, '\\s+'), 'i');
-      query.where('displayname').equals(regex);
+      query.where('displayname').equals(searchPattern(params.displayname));
     }
 
     if (params.city) {
-      const regex = new RegExp(params.city.replace(/\s+/g, '\\s+'), 'i');
-      query.where('city').equals(regex);
+      query.where('city').equals(searchPattern(params.city));
     }
 
     if (params.state) {
-      const regex = new RegExp(params.state.replace(/\s+/g, '\\s+'), 'i');
-      query.where('state').equals(regex);
+      query.where('state').equals(searchPattern(params.state));
     }
 
     if (params.country) {
-      const regex = new RegExp(params.country.replace(/\s+/g, '\\s+'), 'i');
-      query.where('country').equals(regex);
+      query.where('country').equals(searchPattern(params.country));
     }
 
     if (params.sortBy && params.order) {
@@ -122,7 +167,8 @@ export class UsersService {
     const usersWithPosts = await Promise.all(
       users.map(async (user) => {
         const userPosts = await this.postModel
-          .find({ user: user._id, visibility: EPostVisibility.PUBLIC })
+          .find({ user: user._id, visibility: EPostVisibility.PUBLIC, status: EPostStatus.APPROVED })
+          .sort({ createdAt: -1 })
           .exec();
 
         return {
@@ -150,9 +196,25 @@ export class UsersService {
     };
   }
 
+  /**
+   * A profile with the posts the viewer may see. The owner sees all of their
+   * posts; others see approved public posts, plus approved private posts
+   * while an accepted post request grants access.
+   */
   async findByIdWithUserPost(id: string, viewerId?: string) {
+    if (!ObjectId.isValid(id)) return null;
     const user = await this.usersModel.findById(id);
     if (!user) return null;
+    if (viewerId && String(viewerId) === String(id)) {
+      return {
+        ...user.toObject(),
+        usersPost: await this.postModel
+          .find({ user: id })
+          .sort({ createdAt: -1 })
+          .populate({ path: 'likes', select: 'user' })
+          .exec(),
+      };
+    }
     const today = new Date();
     const hasAccess = await this.PostRequestModel.findOne({
       userId: id,
@@ -166,16 +228,20 @@ export class UsersService {
 
     if (hasAccess) {
       query = {
-        $or: [
-          { user: id, visibility: EPostVisibility.PUBLIC },
-          { user: id, visibility: EPostVisibility.PRIVATE },
-        ],
+        user: id,
+        status: EPostStatus.APPROVED,
+        visibility: { $in: [EPostVisibility.PUBLIC, EPostVisibility.PRIVATE] },
       };
     } else {
-      query = { user: id, visibility: EPostVisibility.PUBLIC };
+      query = { user: id, visibility: EPostVisibility.PUBLIC, status: EPostStatus.APPROVED };
     }
 
-    const userPosts = await this.postModel.find(query).exec();
+    // Like owners let clients show whether the viewer liked each post.
+    const userPosts = await this.postModel
+      .find(query)
+      .sort({ createdAt: -1 })
+      .populate({ path: 'likes', select: 'user' })
+      .exec();
 
     return {
       ...user.toObject(),
@@ -536,9 +602,12 @@ export class UsersService {
   
     const userObjectId = new ObjectId(userId);
   
+    // Legacy endpoint (the app now uses GET /chats/conversations). Ids may be
+    // stored as strings or ObjectIds.
     const userChatList = await this.chatMessageModel.find({
-      $or: [{ sender: userId }, { receiver: userId }]
-    });
+      groupId: null,
+      $or: [{ sender: anyId(userId) }, { receiver: anyId(userId) }],
+    }).select('sender receiver');
   
     const uniqueUsers = new Set<string>();
 
@@ -557,7 +626,7 @@ export class UsersService {
 
     const users = await this.usersModel.find({
         _id: { $in: Array.from(uniqueUsers).map(id => new ObjectId(id)) }
-    }).select('_id displayname avatar username');
+    }).select('_id displayname avatar firstName lastName');
 
     return users;
   }

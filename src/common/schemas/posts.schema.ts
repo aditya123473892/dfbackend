@@ -48,6 +48,13 @@ export class Posts {
 
   @Prop({ type: [{ type: mongoose.Schema.Types.ObjectId, ref: 'Like' }] })
   likes: Like[];
+
+  // Compare-and-set version for rebuilding `likes` from the Likes collection.
+  @Prop({ type: Number, default: 0 })
+  likesVersion: number;
 }
 
 export const PostsSchema = SchemaFactory.createForClass(Posts);
+
+PostsSchema.index({ visibility: 1, status: 1, createdAt: -1 });
+PostsSchema.index({ user: 1, createdAt: -1 });

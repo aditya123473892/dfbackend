@@ -13,7 +13,8 @@ import {
   Put,
   Delete,
 } from '@nestjs/common';
-import { UsersService } from './users.service';
+import { SELF_EDITABLE_FIELDS, toUserResponse, UsersService } from './users.service';
+import { withSignedMedia } from 'src/posts/posts.service';
 import { ApiBearerAuth, ApiBody, ApiConsumes, ApiOperation, ApiParam, ApiQuery, ApiResponse, ApiTags } from '@nestjs/swagger';
 import {
   badRequestRes,
@@ -48,7 +49,7 @@ export class UsersController {
   @Get('me')
   async findMe(@AuthUser() authUser: IAuthUser) {
     const user = await this.usersService.findById(authUser.id);
-    return user ? successRes({ user }) : unAuthorizedRes();
+    return user ? successRes({ user: toUserResponse(user, authUser) }) : unAuthorizedRes();
   }
 
   @UseGuards(RolesGuard)
@@ -124,42 +125,52 @@ export class UsersController {
   // @Roles(ERole.ADMIN)
   @Get(':id')
   @ApiParam({ name: 'id', required: true, description: 'User ID to fetch' })
-  @ApiQuery({ name: 'viewerId', description: 'Viewer ID who is requesting the profile' })
   @ApiResponse({ status: 200, description: 'Successfully fetched user details' })
   @ApiResponse({ status: 400, description: 'User not found' })
   async findOne(
     @Param('id') userId: string,
-    @Query('viewerId') viewerId: string
+    @AuthUser() authUser: IAuthUser,
   ) {
-    const user = await this.usersService.findByIdWithUserPost(userId, viewerId);
-    return user ? successRes({ user }) : badRequestRes('User not found!');
+    // Post visibility is decided for the authenticated caller. A `viewerId`
+    // query parameter from older clients is ignored: it could be spoofed.
+    const user = await this.usersService.findByIdWithUserPost(userId, authUser.id);
+    if (!user) return badRequestRes('User not found!');
+    const usersPost = await Promise.all(
+      (user.usersPost || []).map((post) => withSignedMedia(post, this.s3BucketService)),
+    );
+    return successRes({ user: { ...toUserResponse(user, authUser), usersPost } });
   }
 
   @UseGuards(RolesGuard)
   // @Roles(ERole.ADMIN)
   @Get()
-  async findAll(@Query() params: FilterUsersDto) {
+  async findAll(@Query() params: FilterUsersDto, @AuthUser() authUser: IAuthUser) {
     const options = {
       ...DefaultFindParams,
       ...params,
     };
 
     const { users, count } = await this.usersService.findAll(options);
-    return successRes({ users, count });
+    return successRes({ users: users.map((user) => toUserResponse(user, authUser)), count });
   }
 
+  /** Only profile fields; roles, credentials and account state cannot be self-assigned. */
   @Patch('/me')
   async update(
     @Body() updateUserDto: UpdateUserDto,
     @AuthUser() user: IAuthUser,
   ) {
+    const changes = Object.fromEntries(
+      Object.entries(updateUserDto || {}).filter(([key]) => SELF_EDITABLE_FIELDS.includes(key)),
+    );
+    if (!Object.keys(changes).length) return badRequestRes('Nothing to update');
     const updatedUser = await this.usersService.updateOne(
       user.id,
-      updateUserDto,
+      changes as UpdateUserDto,
     );
 
     return updatedUser
-      ? successRes({ user: updatedUser }, 'Profile saved!')
+      ? successRes({ user: toUserResponse(updatedUser, user) }, 'Profile saved!')
       : badRequestRes('Failed to update!');
   }
 

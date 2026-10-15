@@ -1,5 +1,5 @@
 import { ForbiddenException, NotFoundException, PayloadTooLargeException, UnsupportedMediaTypeException } from '@nestjs/common';
-import { ChatService, hasValidMediaSignature } from './chats.service';
+import { anyId, ChatService, hasValidMediaSignature } from './chats.service';
 import { ChatMediaStatus } from 'src/common/schemas/media.schema';
 
 const senderId = '507f1f77bcf86cd799439011';
@@ -144,10 +144,11 @@ describe('ChatService media authorization', () => {
   it('scopes direct history to the authenticated actor and selected peer', async () => {
     const { service, chatModel } = makeService();
     await service.getChatHistory(senderId, recipientId);
+    // Ids are matched in both stored forms (string and ObjectId).
     expect(chatModel.find).toHaveBeenCalledWith({
       $or: [
-        { sender: senderId, receiver: recipientId },
-        { sender: recipientId, receiver: senderId },
+        { sender: anyId(senderId), receiver: anyId(recipientId) },
+        { sender: anyId(recipientId), receiver: anyId(senderId) },
       ],
     });
   });

@@ -33,6 +33,19 @@ export class ChatMessage {
 
   @Prop({ type: Date, default: Date.now })
   sentAt: Date;
+
+  // Client-generated idempotency key, unique per sender. A retried send with
+  // the same key returns the stored message instead of creating a duplicate.
+  @Prop({ required: false })
+  clientId?: string;
 }
 
 export const ChatMessageSchema = SchemaFactory.createForClass(ChatMessage);
+
+ChatMessageSchema.index(
+  { sender: 1, clientId: 1 },
+  { unique: true, partialFilterExpression: { clientId: { $type: 'string' } } },
+);
+ChatMessageSchema.index({ sender: 1, receiver: 1, sentAt: -1 });
+ChatMessageSchema.index({ receiver: 1, isRead: 1 });
+ChatMessageSchema.index({ groupId: 1, sentAt: -1 });

@@ -23,6 +23,16 @@ export class Comment {
     type: mongoose.Schema.Types.ObjectId,
   })
   post: PostsDocument | mongoose.Schema.Types.ObjectId;
+
+  // Client-generated idempotency key, unique per author.
+  @Prop({ required: false })
+  clientId?: string;
 }
 
 export const CommentSchema = SchemaFactory.createForClass(Comment);
+
+CommentSchema.index({ post: 1, createdAt: -1 });
+CommentSchema.index(
+  { user: 1, clientId: 1 },
+  { unique: true, partialFilterExpression: { clientId: { $type: 'string' } } },
+);

@@ -5,11 +5,10 @@ import {
   Get,
   UseGuards,
   Param,
-  NotFoundException,
   Put,
+  Delete,
   UseInterceptors,
   UploadedFile,
-  BadRequestException,
 } from '@nestjs/common';
 import { GroupService } from './group.service';
 import { CreateGroupDto } from './dtos/create-group.dto';
@@ -25,235 +24,106 @@ import {
 } from '@nestjs/swagger';
 import { ApiBearerAuth } from '@nestjs/swagger';
 import { successRes } from 'src/common/interceptors';
-import { JwtAuthGuard, RolesGuard } from 'src/common/guards';
-import { AuthUser, Roles } from 'src/common/decorators';
+import { JwtAuthGuard } from 'src/common/guards';
+import { AuthUser } from 'src/common/decorators';
 import { IAuthUser } from 'src/common/interfaces';
 import { successGetRes } from 'src/common/interceptors/response.handlers';
 import { UpdateGroupDto } from './dtos/update-group.dto';
 import { FileInterceptor } from '@nestjs/platform-express';
-import { S3BucketService } from 'src/s3-bucket/s3-bucket.service';
-import { ERole } from 'src/common/enums';
 
+/**
+ * Any authenticated user can create a group and becomes its owner. Membership
+ * changes, metadata and deletion are restricted to the group owner; reading
+ * requires membership. GroupService enforces these rules.
+ */
 @ApiTags('Groups')
 @ApiBearerAuth()
+@UseGuards(JwtAuthGuard)
 @Controller('groups')
 export class GroupController {
-  constructor(
-    private readonly groupService: GroupService,
-    private readonly s3BucketService: S3BucketService,
-  ) {}
+  constructor(private readonly groupService: GroupService) {}
 
-  @Roles(ERole.ADMIN)
-  @UseGuards(JwtAuthGuard, RolesGuard)
   @Post('create-group')
-  @ApiOperation({ summary: 'Create a new group' })
+  @ApiOperation({ summary: 'Create a new group owned by the caller' })
   @ApiBody({
     schema: {
       type: 'object',
       properties: {
         name: { type: 'string' },
-        admin: { type: 'string' },
-        members: {
-          type: 'array',
-          items: {
-            type: 'string',
-          },
-        },
+        description: { type: 'string' },
+        members: { type: 'array', items: { type: 'string' } },
+        clientId: { type: 'string' },
       },
     },
   })
-  @ApiResponse({
-    status: 201,
-    description: 'Group created successfully',
-    type: Group,
-  })
+  @ApiResponse({ status: 201, description: 'Group created successfully', type: Group })
   @ApiResponse({ status: 400, description: 'Bad Request' })
-  async createGroup(
-    @Body() createGroupDto: CreateGroupDto,
-    @AuthUser() user: IAuthUser,
-  ) {
-    const createGroup = await this.groupService.createGroup(createGroupDto, user.id);
-
-    return successRes(createGroup);
+  async createGroup(@Body() createGroupDto: CreateGroupDto, @AuthUser() user: IAuthUser) {
+    return successRes(await this.groupService.createGroup(createGroupDto, user.id));
   }
 
-  @Roles(ERole.ADMIN)
-  @UseGuards(JwtAuthGuard, RolesGuard)
   @Post('add-members')
-  @ApiOperation({ summary: 'Add members into the group' })
-  @ApiBody({
-    schema: {
-      type: 'object',
-      properties: {
-        groupId: { type: 'string' },
-        members: {
-          type: 'array',
-          items: {
-            type: 'string',
-          },
-        },
-      },
-    },
-  })
-  @ApiResponse({
-    status: 200,
-    description: 'Members added successfully',
-    type: Group,
-  })
-  @ApiResponse({ status: 400, description: 'Bad Request' })
-  async addMembers(
-    @Body() addMembersDto: AddMembersDto,
-    @AuthUser() user: IAuthUser,
-  ) {
-    const addMembers = await this.groupService.addMembers(addMembersDto, user.id);
-
-    return successRes(addMembers);
+  @ApiOperation({ summary: 'Add members to a group (owner only)' })
+  async addMembers(@Body() addMembersDto: AddMembersDto, @AuthUser() user: IAuthUser) {
+    return successRes(await this.groupService.addMembers(addMembersDto, user.id));
   }
 
-  @Roles(ERole.ADMIN)
-  @UseGuards(JwtAuthGuard, RolesGuard)
   @Post('remove-members')
-  @ApiOperation({ summary: 'Remove members from the group' })
-  @ApiBody({
-    schema: {
-      type: 'object',
-      properties: {
-        groupId: { type: 'string' },
-        members: {
-          type: 'array',
-          items: {
-            type: 'string',
-          },
-        },
-      },
-    },
-  })
-  @ApiResponse({
-    status: 200,
-    description: 'Members removed successfully',
-    type: Group,
-  })
-  @ApiResponse({ status: 400, description: 'Bad Request' })
-  async removeMembers(
-    @Body() removeMembersDto: RemoveMembersDto,
-    @AuthUser() user: IAuthUser,
-  ) {
-    const removeMember =
-      await this.groupService.removeMembers(removeMembersDto, user.id);
-
-    return successRes(removeMember);
+  @ApiOperation({ summary: 'Remove members from a group (owner only)' })
+  async removeMembers(@Body() removeMembersDto: RemoveMembersDto, @AuthUser() user: IAuthUser) {
+    return successRes(await this.groupService.removeMembers(removeMembersDto, user.id));
   }
 
-  @UseGuards(JwtAuthGuard, RolesGuard)
   @Get('my-groups')
-  @ApiResponse({
-    status: 200,
-    description: 'Returns all groups the user is a member of',
-    type: [Group],
-  })
-  @ApiResponse({
-    status: 404,
-    description: 'No groups found for this user',
-  })
+  @ApiResponse({ status: 200, description: 'Groups the caller is a member of', type: [Group] })
   async getMyGroups(@AuthUser() user: IAuthUser) {
-    const groups = await this.groupService.getGroupsForUser(user.id);
+    return successGetRes(await this.groupService.getGroupsForUser(user.id));
+  }
 
-    return successGetRes(groups);
+  @Post(':groupId/leave')
+  @ApiOperation({ summary: 'Leave a group; an owner hands ownership to the next member' })
+  async leaveGroup(@Param('groupId') groupId: string, @AuthUser() user: IAuthUser) {
+    return successRes(await this.groupService.leaveGroup(groupId, user.id));
+  }
+
+  @Delete(':groupId')
+  @ApiOperation({ summary: 'Delete a group and its messages (owner only)' })
+  async deleteGroup(@Param('groupId') groupId: string, @AuthUser() user: IAuthUser) {
+    return successRes(await this.groupService.deleteGroup(groupId, user.id));
   }
 
   @Put(':groupId')
-  @Roles(ERole.ADMIN)
-  @UseGuards(JwtAuthGuard, RolesGuard)
-  @ApiOperation({ summary: 'Update group details' })
+  @ApiOperation({ summary: 'Update group details (owner only)' })
   @ApiBody({ type: UpdateGroupDto })
-  @ApiResponse({
-    status: 200,
-    description: 'Group updated successfully',
-    type: Group,
-  })
   async updateGroup(
     @Param('groupId') groupId: string,
     @Body() updateGroupDto: UpdateGroupDto,
     @AuthUser() user: IAuthUser,
   ) {
-    const updatedGroup = await this.groupService.updateGroup(
-      groupId,
-      updateGroupDto,
-      user.id,
-    );
-    return successRes(updatedGroup);
+    return successRes(await this.groupService.updateGroup(groupId, updateGroupDto, user.id));
   }
 
   @Put(':groupId/upload-icon')
-  @Roles(ERole.ADMIN)
-  @UseGuards(JwtAuthGuard, RolesGuard)
   @ApiConsumes('multipart/form-data')
-  @ApiOperation({ summary: 'Upload a group icon to S3' })
+  @ApiOperation({ summary: 'Upload a group image (owner only)' })
   @ApiBody({
     schema: {
       type: 'object',
-      properties: {
-        groupIcon: { type: 'string', format: 'binary' },
-      },
+      properties: { groupIcon: { type: 'string', format: 'binary' } },
     },
   })
-  @UseInterceptors(FileInterceptor('groupIcon'))
-  @ApiResponse({ status: 200, description: 'Group icon uploaded successfully' })
+  @UseInterceptors(FileInterceptor('groupIcon', { limits: { fileSize: 5 * 1024 * 1024 } }))
   async uploadGroupIcon(
     @Param('groupId') groupId: string,
     @UploadedFile() groupIcon: Express.Multer.File,
     @AuthUser() user: IAuthUser,
   ) {
-    let avatarUrl: string | null = null;
-    let oldAvatarKey: string | null = null;
-
-    const groupData = await this.groupService.findById(groupId);
-    if (!groupData || String(groupData.admin) !== user.id) {
-      throw new NotFoundException('Group not found');
-    }
-    if (groupData && groupData.groupIcon) {
-      oldAvatarKey = groupData.groupIcon.split('?')[0];
-      oldAvatarKey = oldAvatarKey.split('/').pop();
-    }
-
-    if (groupIcon) {
-      try {
-        if (oldAvatarKey) {
-          await this.s3BucketService.deleteOne(
-            `groupIcon/${oldAvatarKey}`,
-            process.env.AWS_DEFAULT_S3_BUCKET,
-          );
-        }
-
-        const uploadResult = await this.s3BucketService.uploadFile(
-          groupIcon,
-          'groupIcon',
-        );
-        avatarUrl = await this.s3BucketService.getSignedURL(
-          uploadResult.Key,
-          process.env.AWS_DEFAULT_S3_BUCKET,
-        );
-      } catch (err) {
-        throw new BadRequestException('Failed to upload avatar');
-      }
-    }
-
-    const group = await this.groupService.uploadGroupIcon(groupId, avatarUrl, user.id);
-    return successRes(group);
+    return successRes(await this.groupService.uploadGroupIcon(groupId, groupIcon, user.id));
   }
 
   @Get(':groupId/members')
-  @UseGuards(JwtAuthGuard)
-  @ApiOperation({ summary: 'Get all group members with details' })
-  @ApiResponse({
-    status: 200,
-    description: 'Returns all group members with details',
-  })
-  async getGroupMembers(
-    @Param('groupId') groupId: string,
-    @AuthUser() user: IAuthUser,
-  ) {
-    const members = await this.groupService.getGroupMembers(groupId, user.id);
-    return successGetRes(members);
+  @ApiOperation({ summary: 'Get the group with its members (members only)' })
+  async getGroupMembers(@Param('groupId') groupId: string, @AuthUser() user: IAuthUser) {
+    return successGetRes(await this.groupService.getGroupMembers(groupId, user.id));
   }
 }

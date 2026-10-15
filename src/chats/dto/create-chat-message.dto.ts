@@ -3,6 +3,7 @@ import {
   IsMongoId,
   IsOptional,
   IsString,
+  Matches,
   MaxLength,
 } from 'class-validator';
 
@@ -23,6 +24,12 @@ export class CreateChatMessageDto {
   @IsOptional()
   @IsDateString()
   expiresAt?: string;
+
+  // Idempotency key generated once per message by the client and reused on
+  // retries.
+  @IsOptional()
+  @Matches(/^[A-Za-z0-9_-]{8,64}$/)
+  clientId?: string;
 }
 
 export class ChatMediaQueryDto {

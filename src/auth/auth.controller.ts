@@ -1,5 +1,6 @@
 import { Body, Controller, Get, Post, Req, UseGuards } from '@nestjs/common';
 import { CreateUserDto } from 'src/users/dtos';
+import { toUserResponse } from 'src/users/users.service';
 import {
   ChangePasswordDto,
   ForgotPasswordDto,
@@ -381,7 +382,7 @@ export class AuthController {
         'Account blocked!, contact administrator Dark Fantasy',
       );
 
-    return successRes(user);
+    return successRes(toUserResponse(user, auth));
   }
 
   @ApiBearerAuth()

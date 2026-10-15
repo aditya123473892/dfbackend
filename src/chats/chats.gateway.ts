@@ -64,6 +64,10 @@ export class ChatGateway implements OnGatewayInit, OnGatewayConnection, OnGatewa
       const userId = client.data.userId;
       const user = await this.chatService.getUserById(userId);
       client.join(`user:${userId}`);
+      // Subscribe to every group up front so group messages arrive even before
+      // (or without) a joinGroup call, including after reconnects.
+      const groupIds = await this.chatService.getGroupIdsForUser(userId);
+      if (groupIds.length) client.join(groupIds.map((groupId) => `group:${groupId}`));
       const sockets = this.userSockets.get(userId) || new Set<string>();
       sockets.add(client.id);
       this.userSockets.set(userId, sockets);
@@ -116,7 +120,7 @@ export class ChatGateway implements OnGatewayInit, OnGatewayConnection, OnGatewa
 
   @SubscribeMessage('sendMessage')
   async handleSendMessage(
-    @MessageBody() data: { receiver: string; message?: string; media?: unknown[]; type?: string },
+    @MessageBody() data: { receiver: string; message?: string; media?: unknown[]; type?: string; clientId?: string },
     @ConnectedSocket() client: Socket,
   ) {
     try {
@@ -127,6 +131,7 @@ export class ChatGateway implements OnGatewayInit, OnGatewayConnection, OnGatewa
         receiver: data.receiver,
         message: data.message,
         type: data.type,
+        clientId: data.clientId,
       });
       this.broadcastSavedMessage(saved);
       const unreadData = await this.chatService.getUnreadMessageCount(data.receiver);
@@ -139,11 +144,14 @@ export class ChatGateway implements OnGatewayInit, OnGatewayConnection, OnGatewa
 
   @SubscribeMessage('getChatHistory')
   async handleGetChatHistory(
-    @MessageBody() data: { user1?: string; user2: string },
+    @MessageBody() data: { user1?: string; user2: string; limit?: number; before?: string },
     @ConnectedSocket() client: Socket,
   ) {
     try {
-      const history = await this.chatService.getChatHistory(client.data.userId, data.user2);
+      const history = await this.chatService.getChatHistory(client.data.userId, data?.user2, {
+        limit: data?.limit,
+        before: data?.before,
+      });
       client.emit('chatHistory', history);
     } catch (error) {
       this.emitError(client, error);
@@ -156,9 +164,26 @@ export class ChatGateway implements OnGatewayInit, OnGatewayConnection, OnGatewa
     @ConnectedSocket() client: Socket,
   ) {
     try {
-      const unread = await this.chatService.markMessagesAsRead(client.data.userId, data.user2);
+      const userId = client.data.userId;
+      const unread = await this.chatService.markMessagesAsRead(userId, data.user2);
       client.emit('unreadMessageCount', unread);
-      this.server.to(`user:${data.user2}`).emit('messagesRead', { userId: client.data.userId });
+      // Keep the reader's other devices in sync.
+      client.to(`user:${userId}`).emit('unreadMessageCount', unread);
+      this.server.to(`user:${data.user2}`).emit('messagesRead', { userId });
+    } catch (error) {
+      this.emitError(client, error);
+    }
+  }
+
+  @SubscribeMessage('markGroupAsRead')
+  async handleMarkGroupAsRead(
+    @MessageBody() data: { groupId: string },
+    @ConnectedSocket() client: Socket,
+  ) {
+    try {
+      const result = await this.chatService.markGroupAsRead(client.data.userId, data?.groupId);
+      client.to(`user:${client.data.userId}`).emit('groupRead', result);
+      return result;
     } catch (error) {
       this.emitError(client, error);
     }
@@ -169,12 +194,27 @@ export class ChatGateway implements OnGatewayInit, OnGatewayConnection, OnGatewa
     client.emit('unreadMessageCount', await this.chatService.getUnreadMessageCount(client.data.userId));
   }
 
+  /**
+   * Ephemeral and not persisted. Direct: `{ receiver }`. Group: `{ groupId }`,
+   * relayed only from a socket already in that group's room (membership was
+   * verified when it joined). `isTyping: false` clears the indicator.
+   */
   @SubscribeMessage('typing')
   handleTyping(
-    @MessageBody() data: { receiver: string },
+    @MessageBody() data: { receiver?: string; groupId?: string; isTyping?: boolean },
     @ConnectedSocket() client: Socket,
   ) {
-    this.server.to(`user:${data.receiver}`).emit('typing', { sender: client.data.userId });
+    const sender = client.data.userId;
+    const isTyping = data?.isTyping !== false;
+    if (data?.groupId) {
+      const room = `group:${data.groupId}`;
+      if (ObjectId.isValid(data.groupId) && client.rooms?.has(room)) {
+        client.to(room).emit('typing', { sender, groupId: data.groupId, isTyping });
+      }
+      return;
+    }
+    if (!ObjectId.isValid(data?.receiver) || data.receiver === sender) return;
+    this.server.to(`user:${data.receiver}`).emit('typing', { sender, isTyping });
   }
 
   @SubscribeMessage('updateMessage')
@@ -209,7 +249,7 @@ export class ChatGateway implements OnGatewayInit, OnGatewayConnection, OnGatewa
 
   @SubscribeMessage('sendGroupMessage')
   async handleSendGroupMessage(
-    @MessageBody() data: { sender?: string; groupId: string; message?: string; media?: unknown[] },
+    @MessageBody() data: { sender?: string; groupId: string; message?: string; media?: unknown[]; clientId?: string },
     @ConnectedSocket() client: Socket,
   ) {
     try {
@@ -220,6 +260,7 @@ export class ChatGateway implements OnGatewayInit, OnGatewayConnection, OnGatewa
         groupId: data.groupId,
         message: data.message,
         type: 'group',
+        clientId: data.clientId,
       });
       this.broadcastSavedMessage(saved);
       return saved;
@@ -230,11 +271,14 @@ export class ChatGateway implements OnGatewayInit, OnGatewayConnection, OnGatewa
 
   @SubscribeMessage('getGroupChatHistory')
   async handleGetGroupChatHistory(
-    @MessageBody() data: { groupId: string },
+    @MessageBody() data: { groupId: string; limit?: number; before?: string },
     @ConnectedSocket() client: Socket,
   ) {
     try {
-      const history = await this.chatService.getChatGroupHistory(client.data.userId, data.groupId);
+      const history = await this.chatService.getChatGroupHistory(client.data.userId, data?.groupId, {
+        limit: data?.limit,
+        before: data?.before,
+      });
       client.emit('groupChatHistory', history);
     } catch (error) {
       this.emitError(client, error);
@@ -248,9 +292,46 @@ export class ChatGateway implements OnGatewayInit, OnGatewayConnection, OnGatewa
       this.server.to(`group:${message.groupId}`).emit(event || 'receiveGroupMessage', message);
       return;
     }
-    const eventName = event || 'receiveMessage';
-    this.server.to(`user:${senderId}`).emit(eventName, message);
-    this.server.to(`user:${message.receiver}`).emit(eventName, message);
+    // One emit to both rooms: Socket.IO delivers once per socket.
+    this.server
+      .to([`user:${senderId}`, `user:${message.receiver?._id || message.receiver}`])
+      .emit(event || 'receiveMessage', message);
+  }
+
+  /**
+   * Applies a membership change to live sockets: added members start receiving
+   * the group's events immediately, removed members stop immediately.
+   */
+  syncGroupMembership(group: any, added: string[] = [], removed: string[] = []) {
+    if (!this.server) return;
+    const groupId = String(group._id);
+    const room = `group:${groupId}`;
+    for (const userId of added) this.server.in(`user:${userId}`).socketsJoin(room);
+    for (const userId of removed) {
+      this.server.in(`user:${userId}`).socketsLeave(room);
+      this.server.to(`user:${userId}`).emit('groupRemoved', { groupId });
+    }
+    this.server.to(room).emit('groupUpdated', this.groupSummary(group));
+  }
+
+  /** Notifies members, then detaches every socket from a deleted group. */
+  broadcastGroupDeleted(groupId: string) {
+    if (!this.server) return;
+    const room = `group:${groupId}`;
+    this.server.to(room).emit('groupRemoved', { groupId, deleted: true });
+    this.server.in(room).socketsLeave(room);
+  }
+
+  private groupSummary(group: any) {
+    return {
+      _id: String(group._id),
+      name: group.name,
+      description: group.description,
+      groupIcon: group.groupIcon,
+      admin: String(group.admin),
+      memberCount: group.members?.length || 0,
+      updatedAt: group.updatedAt,
+    };
   }
 
   private emitError(client: Socket, error: any) {

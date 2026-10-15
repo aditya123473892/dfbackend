@@ -23,3 +23,7 @@ export class Like {
 }
 
 export const LikeSchema = SchemaFactory.createForClass(Like);
+
+// One like per user per post. Existing duplicates must be removed before this
+// index can build: `npm run db:repair-post-interactions`.
+LikeSchema.index({ post: 1, user: 1 }, { unique: true });

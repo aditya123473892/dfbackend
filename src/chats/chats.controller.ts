@@ -34,6 +34,17 @@ export class ChatsController {
     private readonly chatGateway: ChatGateway,
   ) {}
 
+  /** Direct and group conversations with last message and unread count, newest first. */
+  @Get('conversations')
+  async listConversations(@AuthUser() user: IAuthUser) {
+    return successGetRes({ conversations: await this.chatService.getConversations(user.id) });
+  }
+
+  @Post('groups/:groupId/read')
+  async markGroupRead(@AuthUser() user: IAuthUser, @Param('groupId') groupId: string) {
+    return successRes(await this.chatService.markGroupAsRead(user.id, groupId));
+  }
+
   @Post('messages')
   @ApiConsumes('multipart/form-data')
   @UseInterceptors(

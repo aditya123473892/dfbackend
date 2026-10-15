@@ -1,4 +1,4 @@
-import { IsNotEmpty, IsArray, IsMongoId } from 'class-validator';
+import { ArrayMaxSize, ArrayMinSize, IsArray, IsMongoId, IsNotEmpty } from 'class-validator';
 
 export class RemoveMembersDto {
   @IsMongoId()
@@ -6,6 +6,8 @@ export class RemoveMembersDto {
   groupId: string;
 
   @IsArray()
+  @ArrayMinSize(1)
+  @ArrayMaxSize(255)
   @IsMongoId({ each: true })
   members: string[];
 }

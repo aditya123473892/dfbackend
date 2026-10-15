@@ -15,6 +15,10 @@ import {
   ChatMediaAudit,
   ChatMediaAuditSchema,
 } from 'src/common/schemas/chat-media-audit.schema';
+import {
+  ChatReadCursor,
+  ChatReadCursorSchema,
+} from 'src/common/schemas/chat-read-cursor.schema';
 import { ChatsController } from './chats.controller';
 import { JwtModule } from '@nestjs/jwt';
 import { ConfigModule, ConfigService } from '@nestjs/config';
@@ -26,6 +30,7 @@ import { ConfigModule, ConfigService } from '@nestjs/config';
       { name: Users.name, schema: UsersSchema },
       { name: Group.name, schema: GroupSchema },
       { name: ChatMediaAudit.name, schema: ChatMediaAuditSchema },
+      { name: ChatReadCursor.name, schema: ChatReadCursorSchema },
     ]),
     JwtModule.registerAsync({
       imports: [ConfigModule],
@@ -42,6 +47,6 @@ import { ConfigModule, ConfigService } from '@nestjs/config';
   ],
   controllers: [ChatsController],
   providers: [ChatGateway, ChatService, S3BucketService],
-  exports: [MongooseModule, ChatService],
+  exports: [MongooseModule, ChatService, ChatGateway],
 })
 export class ChatModule {}
