@@ -309,7 +309,6 @@ export class PostsController {
 
     const { posts, count } = await this.postsService.findAllPublic(options, user.id);
 
-    console.log(posts);
 
     return successRes({ posts, count });
   }

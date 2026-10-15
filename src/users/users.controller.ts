@@ -98,7 +98,6 @@ export class UsersController {
     @AuthUser() authUser: IAuthUser,
   ) {
     try {
-      console.log("authUser..", authUser)
       const bookMark = await this.usersService.getUserBookMark(authUser.id);
       return successRes({ bookMark }, 'Get Book Marks users successfully');
     } catch (error) {
@@ -132,7 +131,6 @@ export class UsersController {
     @Param('id') userId: string,
     @Query('viewerId') viewerId: string
   ) {
-    console.log(viewerId,userId,'sasas')
     const user = await this.usersService.findByIdWithUserPost(userId, viewerId);
     return user ? successRes({ user }) : badRequestRes('User not found!');
   }
@@ -498,7 +496,6 @@ export class UsersController {
   @ApiOperation({ summary: 'Get all follow requests for the user' })
   async getFollowRequests(@AuthUser() authUser: IAuthUser) {
     const followRequests = await this.usersService.getFollowRequests(authUser.id);
-    console.log("🚀 ~ UsersController ~ getFollowRequests ~ followRequests:", followRequests)
     return successRes({ followRequests });
   }
 

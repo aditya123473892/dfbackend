@@ -539,7 +539,6 @@ export class UsersService {
     const userChatList = await this.chatMessageModel.find({
       $or: [{ sender: userId }, { receiver: userId }]
     });
-    console.log("userChatList", userChatList)
   
     const uniqueUsers = new Set<string>();
 
@@ -552,7 +551,6 @@ export class UsersService {
         }
     });
 
-    console.log("uniqueUsers", Array.from(uniqueUsers));
 
     // Fetch user details for the unique user IDs
     if (uniqueUsers.size === 0) return []; // No users found, return empty array

@@ -203,7 +203,6 @@ export class PostsService {
       query.exec(),
       this.postsModel.countDocuments(query.getQuery()),
     ]);
-    console.log("🚀 ~ PostsService ~ posts:", posts)
 
     const userBookmarks = await this.PostBookMarkModel.find({
       userId: authUserId,
