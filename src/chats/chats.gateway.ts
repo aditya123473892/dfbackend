@@ -120,7 +120,7 @@ export class ChatGateway implements OnGatewayInit, OnGatewayConnection, OnGatewa
 
   @SubscribeMessage('sendMessage')
   async handleSendMessage(
-    @MessageBody() data: { receiver: string; message?: string; media?: unknown[]; type?: string; clientId?: string },
+    @MessageBody() data: { receiver: string; message?: string; media?: unknown[]; type?: string; clientId?: string; ttlSeconds?: number },
     @ConnectedSocket() client: Socket,
   ) {
     try {
@@ -132,6 +132,7 @@ export class ChatGateway implements OnGatewayInit, OnGatewayConnection, OnGatewa
         message: data.message,
         type: data.type,
         clientId: data.clientId,
+        ttlSeconds: data.ttlSeconds,
       });
       this.broadcastSavedMessage(saved);
       const unreadData = await this.chatService.getUnreadMessageCount(data.receiver);
@@ -249,7 +250,7 @@ export class ChatGateway implements OnGatewayInit, OnGatewayConnection, OnGatewa
 
   @SubscribeMessage('sendGroupMessage')
   async handleSendGroupMessage(
-    @MessageBody() data: { sender?: string; groupId: string; message?: string; media?: unknown[]; clientId?: string },
+    @MessageBody() data: { sender?: string; groupId: string; message?: string; media?: unknown[]; clientId?: string; ttlSeconds?: number },
     @ConnectedSocket() client: Socket,
   ) {
     try {
@@ -261,6 +262,7 @@ export class ChatGateway implements OnGatewayInit, OnGatewayConnection, OnGatewa
         message: data.message,
         type: 'group',
         clientId: data.clientId,
+        ttlSeconds: data.ttlSeconds,
       });
       this.broadcastSavedMessage(saved);
       return saved;

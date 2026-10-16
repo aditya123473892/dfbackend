@@ -20,6 +20,7 @@ import {
   ChatReadCursorSchema,
 } from 'src/common/schemas/chat-read-cursor.schema';
 import { ChatsController } from './chats.controller';
+import { ChatExpiryService } from './chat-expiry.service';
 import { JwtModule } from '@nestjs/jwt';
 import { ConfigModule, ConfigService } from '@nestjs/config';
 
@@ -46,7 +47,7 @@ import { ConfigModule, ConfigService } from '@nestjs/config';
     CouponModule,
   ],
   controllers: [ChatsController],
-  providers: [ChatGateway, ChatService, S3BucketService],
+  providers: [ChatGateway, ChatService, S3BucketService, ChatExpiryService],
   exports: [MongooseModule, ChatService, ChatGateway],
 })
 export class ChatModule {}

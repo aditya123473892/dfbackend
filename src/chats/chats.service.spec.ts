@@ -144,11 +144,17 @@ describe('ChatService media authorization', () => {
   it('scopes direct history to the authenticated actor and selected peer', async () => {
     const { service, chatModel } = makeService();
     await service.getChatHistory(senderId, recipientId);
-    // Ids are matched in both stored forms (string and ObjectId).
+    // Ids are matched in both stored forms (string and ObjectId); expired
+    // disappearing messages are excluded.
     expect(chatModel.find).toHaveBeenCalledWith({
-      $or: [
-        { sender: anyId(senderId), receiver: anyId(recipientId) },
-        { sender: anyId(recipientId), receiver: anyId(senderId) },
+      $and: [
+        {
+          $or: [
+            { sender: anyId(senderId), receiver: anyId(recipientId) },
+            { sender: anyId(recipientId), receiver: anyId(senderId) },
+          ],
+        },
+        { $or: [{ expiresAt: null }, { expiresAt: { $gt: expect.any(Date) } }] },
       ],
     });
   });

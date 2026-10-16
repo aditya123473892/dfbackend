@@ -68,9 +68,14 @@ export class ChatsController {
     @Param('messageId') messageId: string,
     @Param('mediaId') mediaId: string,
   ) {
-    return successGetRes(
-      await this.chatService.getMediaAccessUrl(user.id, messageId, mediaId),
+    const { message, ...access } = await this.chatService.getMediaAccessUrl(
+      user.id,
+      messageId,
+      mediaId,
     );
+    // Opening view-once media updates the message for both participants.
+    if (message) this.chatGateway.broadcastSavedMessage(message, 'messageUpdated');
+    return successGetRes(access);
   }
 
   @Patch('messages/:messageId/media/:mediaId/revoke')

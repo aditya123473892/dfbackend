@@ -2,6 +2,7 @@ import {
   BadRequestException,
   ConflictException,
   ForbiddenException,
+  GoneException,
   Injectable,
   NotFoundException,
   PayloadTooLargeException,
@@ -54,6 +55,20 @@ export const MAX_HISTORY_PAGE = 100;
 // (the account email), phone number or account-management fields.
 export const PUBLIC_USER_FIELDS = 'displayname avatar firstName lastName';
 const CLIENT_ID_PATTERN = /^[A-Za-z0-9_-]{8,64}$/;
+/** Allowed disappearing-message timers: 30 s, 5 min, 1 h, 1 day, 1 week. */
+export const MESSAGE_TTL_SECONDS = [30, 300, 3600, 86400, 604800];
+/** An unopened view-once item is removed after this long. */
+export const VIEW_ONCE_UNOPENED_SECONDS = 14 * 86400;
+const PURGE_BATCH = 200;
+
+/**
+ * Matches messages whose timer has not run out. Expired messages are hidden
+ * from every read immediately; the sweeper deletes them later.
+ */
+export function notExpired(now = new Date()) {
+  return { $or: [{ expiresAt: null }, { expiresAt: { $gt: now } }] };
+}
+const live = (filter: any) => ({ $and: [filter, notExpired()] });
 
 export type HistoryPage = { limit?: number; before?: string };
 
@@ -137,11 +152,13 @@ export class ChatService {
     return groups.map((group: any) => String(group._id));
   }
 
-  async saveTextMessage(data: { sender: string; receiver?: string; groupId?: string; message?: string; type?: string; clientId?: string }) {
+  async saveTextMessage(data: { sender: string; receiver?: string; groupId?: string; message?: string; type?: string; clientId?: string; ttlSeconds?: unknown }) {
     const text = typeof data.message === 'string' ? data.message.trim() : '';
     if (!text) throw new BadRequestException('Message cannot be empty');
     if (text.length > MAX_MESSAGE_LENGTH) throw new BadRequestException(`Messages are limited to ${MAX_MESSAGE_LENGTH} characters`);
     const clientId = this.normalizeClientId(data.clientId);
+    const sentAt = new Date();
+    const expiresAt = this.messageExpiry(sentAt, data.ttlSeconds);
     const existing = await this.findIdempotentMessage(data.sender, clientId, data);
     if (existing) return existing;
     try {
@@ -149,7 +166,7 @@ export class ChatService {
         sender: toObjectId(data.sender),
         receiver: data.receiver ? toObjectId(data.receiver) : undefined,
         groupId: data.groupId ? toObjectId(data.groupId) : undefined,
-        message: text, type: data.type || 'text', clientId,
+        message: text, type: data.type || 'text', clientId, sentAt, expiresAt,
       }).save();
       return this.toClientMessage(saved);
     } catch (error) {
@@ -165,6 +182,14 @@ export class ChatService {
     if (!dto.message?.trim() && files.length === 0) throw new BadRequestException('A message or attachment is required');
     if (dto.groupId) await this.assertGroupMember(actorId, dto.groupId);
     else await this.assertCanSendDirect(actorId, dto.receiver);
+    const viewOnce = this.parseFlag(dto.viewOnce, 'viewOnce');
+    if (viewOnce) {
+      if (dto.groupId) throw new BadRequestException('View-once media can only be sent in direct chats');
+      if (files.length !== 1) throw new BadRequestException('A view-once message must contain exactly one photo or video');
+      if (dto.message?.trim()) throw new BadRequestException('View-once messages cannot include text');
+    }
+    const sentAt = new Date();
+    const messageExpiresAt = this.messageExpiry(sentAt, dto.ttlSeconds, viewOnce);
     const clientId = this.normalizeClientId(dto.clientId);
     // Check before uploading so a retried send does not store its media twice.
     const existing = await this.findIdempotentMessage(actorId, clientId, dto);
@@ -199,7 +224,8 @@ export class ChatService {
         receiver: dto.receiver ? toObjectId(dto.receiver) : undefined,
         groupId: dto.groupId ? toObjectId(dto.groupId) : undefined,
         message: dto.message?.trim(), media: uploaded, type: files.length ? 'media' : 'text',
-        clientId,
+        clientId, sentAt, expiresAt: messageExpiresAt,
+        ...(viewOnce ? { viewOnce: true } : {}),
       }).save();
     } catch (error) {
       await Promise.all(uploaded.map((media) => this.s3BucketService.deleteOne(media.storageKey)));
@@ -227,7 +253,7 @@ export class ChatService {
       ],
     };
     if (!page.limit) {
-      const messages = await this.chatMessageModel.find(filter).sort({ sentAt: 1 });
+      const messages = await this.chatMessageModel.find(live(filter)).sort({ sentAt: 1 });
       return messages.map((message) => this.toClientMessage(message));
     }
     return this.findHistoryPage(filter, page);
@@ -236,7 +262,7 @@ export class ChatService {
   async getChatGroupHistory(actorId: string, groupId: string, page: HistoryPage = {}) {
     await this.assertGroupMember(actorId, groupId);
     if (!page.limit) {
-      const messages = await this.chatMessageModel.find({ groupId: anyId(groupId) }).populate({
+      const messages = await this.chatMessageModel.find(live({ groupId: anyId(groupId) })).populate({
         path: 'sender', select: PUBLIC_USER_FIELDS,
       }).sort({ sentAt: 1 });
       return messages.map((message) => this.toClientMessage(message));
@@ -248,7 +274,7 @@ export class ChatService {
     // Kept as an array of unread direct messages for compatibility; only the
     // fields clients need to count and attribute them are returned.
     return this.chatMessageModel
-      .find({ receiver: anyId(actorId), isRead: false })
+      .find(live({ receiver: anyId(actorId), isRead: false }))
       .select('_id sender receiver sentAt isRead');
   }
 
@@ -296,7 +322,7 @@ export class ChatService {
 
     // Ids may be stored as strings or ObjectIds, so they are compared as strings.
     const direct = await this.chatMessageModel.aggregate([
-      { $match: { groupId: null, receiver: { $ne: null }, $or: [{ sender: { $in: meForms } }, { receiver: { $in: meForms } }] } },
+      { $match: live({ groupId: null, receiver: { $ne: null }, $or: [{ sender: { $in: meForms } }, { receiver: { $in: meForms } }] }) },
       { $sort: { sentAt: -1, _id: -1 } },
       {
         $addFields: {
@@ -329,7 +355,7 @@ export class ChatService {
     const [groupLast, cursors] = groupIds.length
       ? await Promise.all([
           this.chatMessageModel.aggregate([
-            { $match: { groupId: { $in: idForms(groupIds) } } },
+            { $match: live({ groupId: { $in: idForms(groupIds) } }) },
             { $sort: { sentAt: -1, _id: -1 } },
             { $group: { _id: { $toString: '$groupId' }, last: { $first: '$$ROOT' } } },
           ]),
@@ -342,13 +368,13 @@ export class ChatService {
     const groupUnread = groupIds.length
       ? await this.chatMessageModel.aggregate([
           {
-            $match: {
+            $match: live({
               sender: { $nin: meForms },
               $or: groupIds.map((id) => ({
                 groupId: { $in: idForms([id]) },
                 sentAt: { $gt: readAt.get(String(id)) || new Date(0) },
               })),
-            },
+            }),
           },
           { $group: { _id: { $toString: '$groupId' }, count: { $sum: 1 } } },
         ])
@@ -454,10 +480,85 @@ export class ChatService {
     const storageKey = media.storageKey || media.filename;
     if (!storageKey) throw new NotFoundException('Media not found');
     const expiresIn = this.urlTtl;
-    const url = await this.s3BucketService.getSignedURL(storageKey, undefined, expiresIn);
+    // A view-once item is consumed before its URL is signed, so concurrent
+    // requests cannot both obtain one.
+    const opened = (message as any).viewOnce ? await this.consumeViewOnce(actorId, message, media) : null;
+    let url: string | null = null;
+    try {
+      url = await this.s3BucketService.getSignedURL(storageKey, undefined, expiresIn);
+    } finally {
+      if (!url && opened) await this.chatMessageModel.updateOne({ _id: message._id, viewedAt: opened.viewedAt }, { $unset: { viewedAt: 1 } });
+    }
     if (!url) throw new NotFoundException('Media not found');
     await this.audit(actorId, ChatMediaAuditAction.ACCESS_URL_ISSUED, message, media, { expiresIn });
-    return { url, expiresIn };
+    return opened ? { url, expiresIn, viewOnce: true, message: opened } : { url, expiresIn };
+  }
+
+  /** Marks a view-once message opened; only its recipient can, and only once. */
+  private async consumeViewOnce(actorId: string, message: any, media: any) {
+    if (String(message.receiver) !== String(actorId)) {
+      await this.audit(actorId, ChatMediaAuditAction.ACCESS_DENIED, message, media, { reason: 'view_once_not_recipient' });
+      throw new ForbiddenException('Only the recipient can open view-once media');
+    }
+    const updated = await this.chatMessageModel.findOneAndUpdate(
+      { _id: message._id, viewOnce: true, viewedAt: null },
+      { $set: { viewedAt: new Date() } },
+      { new: true },
+    );
+    if (!updated) {
+      await this.audit(actorId, ChatMediaAuditAction.ACCESS_DENIED, message, media, { reason: 'view_once_opened' });
+      throw new GoneException('This view-once media was already opened');
+    }
+    await this.audit(actorId, ChatMediaAuditAction.VIEW_ONCE_OPENED, message, media);
+    return this.toClientMessage(updated);
+  }
+
+  /**
+   * Deletes messages whose timer ran out, together with their stored media.
+   * Returns the removed messages so they can be broadcast as deletions.
+   */
+  async purgeExpiredMessages(now = new Date(), limit = PURGE_BATCH) {
+    const rows = await this.chatMessageModel
+      .find({ expiresAt: { $lte: now } })
+      .select('+media.storageKey')
+      .limit(limit);
+    const purged = [];
+    for (const message of rows as any[]) {
+      for (const media of message.media || []) {
+        const key = media.storageKey || media.filename;
+        if (key) await this.s3BucketService.deleteOne(key);
+        await this.audit(String(message.sender), ChatMediaAuditAction.DELETED, message, media, { reason: 'expired' });
+      }
+      const { deletedCount } = await this.chatMessageModel.deleteOne({ _id: message._id, expiresAt: { $lte: now } });
+      if (deletedCount) purged.push(this.toClientMessage(message));
+    }
+    return purged;
+  }
+
+  /**
+   * Deletes the stored file of view-once media once its single access URL can
+   * no longer be valid. The message stays, with its media marked revoked.
+   */
+  async purgeOpenedViewOnceMedia(now = new Date(), limit = PURGE_BATCH) {
+    const cutoff = new Date(now.getTime() - this.urlTtl * 1000);
+    const rows = await this.chatMessageModel
+      .find({ viewOnce: true, viewedAt: { $lte: cutoff }, 'media.status': ChatMediaStatus.ACTIVE })
+      .select('+media.storageKey')
+      .limit(limit);
+    const purged = [];
+    for (const message of rows as any[]) {
+      for (const media of message.media || []) {
+        const key = media.storageKey || media.filename;
+        if (key) await this.s3BucketService.deleteOne(key);
+        media.status = ChatMediaStatus.REVOKED;
+        media.revokedAt = now;
+        media.storageKey = undefined;
+        media.filename = undefined;
+        await this.audit(String(message.sender), ChatMediaAuditAction.DELETED, message, media, { reason: 'view_once_opened' });
+      }
+      purged.push(this.toClientMessage(await message.save()));
+    }
+    return purged;
   }
 
   async revokeMedia(actorId: string, messageId: string, mediaId: string) {
@@ -508,7 +609,8 @@ export class ChatService {
         'media.0': { $exists: true },
       };
     }
-    const messages = await this.chatMessageModel.find(filter).sort({ sentAt: -1 });
+    // View-once media is never listed in the shared media gallery.
+    const messages = await this.chatMessageModel.find(live({ ...filter, viewOnce: { $ne: true } })).sort({ sentAt: -1 });
     return messages.flatMap((message: any) => {
       const safe = this.toClientMessage(message);
       return (safe.media || []).map((media) => ({ ...media, messageId: safe._id, sender: safe.sender, sentAt: safe.sentAt }));
@@ -529,6 +631,26 @@ export class ChatService {
   private withoutAggregateFields(message: any) {
     const { fromMe, toMe, peer, ...rest } = message;
     return rest;
+  }
+
+  /** Expiry for a disappearing message, from a timer in MESSAGE_TTL_SECONDS. */
+  private messageExpiry(sentAt: Date, value: unknown, viewOnce = false): Date | undefined {
+    let ttl: number | undefined;
+    if (value !== undefined && value !== null && value !== '') {
+      ttl = Number(value);
+      if (!MESSAGE_TTL_SECONDS.includes(ttl)) {
+        throw new BadRequestException(`ttlSeconds must be one of ${MESSAGE_TTL_SECONDS.join(', ')}`);
+      }
+    }
+    // Unopened view-once media does not stay stored indefinitely.
+    if (viewOnce) ttl = Math.min(ttl ?? VIEW_ONCE_UNOPENED_SECONDS, VIEW_ONCE_UNOPENED_SECONDS);
+    return ttl ? new Date(sentAt.getTime() + ttl * 1000) : undefined;
+  }
+
+  private parseFlag(value: unknown, name: string): boolean {
+    if (value === undefined || value === null || value === '' || value === false || value === 'false') return false;
+    if (value === true || value === 'true') return true;
+    throw new BadRequestException(`${name} must be a boolean`);
   }
 
   private normalizeClientId(value: unknown): string | undefined {
@@ -572,7 +694,9 @@ export class ChatService {
         }],
       };
     }
-    let finder: any = this.chatMessageModel.find(query).sort({ sentAt: -1, _id: -1 }).limit(limit);
+    // The cursor itself may have expired since the client loaded it; only the
+    // returned rows are filtered.
+    let finder: any = this.chatMessageModel.find(live(query)).sort({ sentAt: -1, _id: -1 }).limit(limit);
     if (populateSender) finder = finder.populate({ path: 'sender', select: PUBLIC_USER_FIELDS });
     const rows = await finder;
     return rows.reverse().map((message) => this.toClientMessage(message));
@@ -584,6 +708,7 @@ export class ChatService {
     if (includeStorageKey) finder = finder.select('+media.storageKey');
     const message = await finder;
     if (!message) throw new NotFoundException('Message not found');
+    if (message.expiresAt && new Date(message.expiresAt) <= new Date()) throw new NotFoundException('Message not found');
     try {
       if (message.groupId) await this.assertGroupMember(actorId, String(message.groupId));
       else if (String(message.sender) !== actorId && String(message.receiver) !== actorId) throw new NotFoundException('Message not found');
