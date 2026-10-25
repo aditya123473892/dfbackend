@@ -11,6 +11,9 @@ import {
   UploadedFile,
   BadRequestException,
 } from '@nestjs/common';
+import { PhotosService } from '../photos/photos.service';
+import { PhotoReferenceDto } from '../photos/photo.dto';
+import { ValidationPipe } from '@nestjs/common';
 import { GroupService } from './group.service';
 import { CreateGroupDto } from './dtos/create-group.dto';
 import { Group } from '../common/schemas/group-chat.schema';
@@ -40,6 +43,7 @@ import { ERole } from 'src/common/enums';
 export class GroupController {
   constructor(
     private readonly groupService: GroupService,
+    private readonly photos: PhotosService,
     private readonly s3BucketService: S3BucketService,
   ) {}
 
@@ -72,7 +76,10 @@ export class GroupController {
     @Body() createGroupDto: CreateGroupDto,
     @AuthUser() user: IAuthUser,
   ) {
-    const createGroup = await this.groupService.createGroup(createGroupDto, user.id);
+    const createGroup = await this.groupService.createGroup(
+      createGroupDto,
+      user.id,
+    );
 
     return successRes(createGroup);
   }
@@ -105,7 +112,10 @@ export class GroupController {
     @Body() addMembersDto: AddMembersDto,
     @AuthUser() user: IAuthUser,
   ) {
-    const addMembers = await this.groupService.addMembers(addMembersDto, user.id);
+    const addMembers = await this.groupService.addMembers(
+      addMembersDto,
+      user.id,
+    );
 
     return successRes(addMembers);
   }
@@ -138,8 +148,10 @@ export class GroupController {
     @Body() removeMembersDto: RemoveMembersDto,
     @AuthUser() user: IAuthUser,
   ) {
-    const removeMember =
-      await this.groupService.removeMembers(removeMembersDto, user.id);
+    const removeMember = await this.groupService.removeMembers(
+      removeMembersDto,
+      user.id,
+    );
 
     return successRes(removeMember);
   }
@@ -185,60 +197,29 @@ export class GroupController {
   }
 
   @Put(':groupId/upload-icon')
-  @Roles(ERole.ADMIN)
-  @UseGuards(JwtAuthGuard, RolesGuard)
-  @ApiConsumes('multipart/form-data')
-  @ApiOperation({ summary: 'Upload a group icon to S3' })
-  @ApiBody({
-    schema: {
-      type: 'object',
-      properties: {
-        groupIcon: { type: 'string', format: 'binary' },
-      },
-    },
-  })
-  @UseInterceptors(FileInterceptor('groupIcon'))
-  @ApiResponse({ status: 200, description: 'Group icon uploaded successfully' })
+  @UseGuards(JwtAuthGuard)
   async uploadGroupIcon(
     @Param('groupId') groupId: string,
-    @UploadedFile() groupIcon: Express.Multer.File,
-    @AuthUser() user: IAuthUser,
+    @Body(new ValidationPipe({ whitelist: true, forbidNonWhitelisted: true }))
+    dto: PhotoReferenceDto,
+    @AuthUser() actor: IAuthUser,
   ) {
-    let avatarUrl: string | null = null;
-    let oldAvatarKey: string | null = null;
-
-    const groupData = await this.groupService.findById(groupId);
-    if (!groupData || String(groupData.admin) !== user.id) {
+    const current = await this.groupService.findById(groupId);
+    if (!current || String(current.admin) !== actor.id)
       throw new NotFoundException('Group not found');
-    }
-    if (groupData && groupData.groupIcon) {
-      oldAvatarKey = groupData.groupIcon.split('?')[0];
-      oldAvatarKey = oldAvatarKey.split('/').pop();
-    }
-
-    if (groupIcon) {
-      try {
-        if (oldAvatarKey) {
-          await this.s3BucketService.deleteOne(
-            `groupIcon/${oldAvatarKey}`,
-            process.env.AWS_DEFAULT_S3_BUCKET,
-          );
-        }
-
-        const uploadResult = await this.s3BucketService.uploadFile(
-          groupIcon,
-          'groupIcon',
-        );
-        avatarUrl = await this.s3BucketService.getSignedURL(
-          uploadResult.Key,
-          process.env.AWS_DEFAULT_S3_BUCKET,
-        );
-      } catch (err) {
-        throw new BadRequestException('Failed to upload avatar');
-      }
-    }
-
-    const group = await this.groupService.uploadGroupIcon(groupId, avatarUrl, user.id);
+    const ref = `group:${groupId}`;
+    const [photo] = await this.photos.bind(actor.id, [dto.uploadId], ref);
+    const group = await this.photos.replaceImage(
+      'Groups',
+      groupId,
+      'groupIcon',
+      current.groupIcon,
+      photo.filename,
+    );
+    if (current.groupIcon && current.groupIcon !== photo.filename)
+      await this.photos.retire(ref, [current.groupIcon]);
+    if (current.groupIcon && current.groupIcon !== photo.filename)
+      await this.photos.enqueue([current.groupIcon]);
     return successRes(group);
   }
 

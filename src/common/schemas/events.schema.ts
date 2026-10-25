@@ -37,7 +37,7 @@ export class Events {
   @Prop()
   tags: any[];
 
-  @Prop({
+  @Prop({ type: String,
     enum: EventType,
     required: true,
     default: EventType.OFFLINE,
@@ -59,7 +59,7 @@ export class Events {
   @Prop({ type: Date, required: false })
   registrationDeadline: Date;
 
-  @Prop({
+  @Prop({ type: String,
     enum: EventStatus,
     required: true,
     default: EventStatus.UPCOMING,

@@ -9,7 +9,7 @@ describe('EventMembersController', () => {
     const module: TestingModule = await Test.createTestingModule({
       controllers: [EventMembersController],
       providers: [EventMembersService],
-    }).compile();
+    }).useMocker(() => ({})).compile();
 
     controller = module.get<EventMembersController>(EventMembersController);
   });

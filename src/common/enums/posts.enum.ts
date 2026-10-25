@@ -1,3 +1,8 @@
+export enum EContentVisibility {
+  NORMAL = 'normal',
+  PREMIUM = 'premium',
+}
+
 export enum EPostVisibility {
   PUBLIC = 'public',
   PRIVATE = 'private',

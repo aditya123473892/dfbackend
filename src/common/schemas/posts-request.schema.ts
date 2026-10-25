@@ -21,7 +21,7 @@ export class PostRequest {
     })
     requestedUserId: UsersDocument | mongoose.Schema.Types.ObjectId;
 
-    @Prop({
+    @Prop({ type: String,
         enum: EPostStatus,
         required: true,
         default: EPostStatus.PENDING,

@@ -16,6 +16,12 @@ import { PostRequest, PostRequestSchema } from 'src/common/schemas/posts-request
 import { UserBookMark, UserBookMarkSchema } from 'src/common/schemas/user-bookmark.schema';
 import { UserSubscriptionsModule } from 'src/user-subscription/user-subscription.module';
 import { ChatModule } from 'src/chats/chats.module';
+import { OtpController } from './otp/otp.controller';
+import { OtpService } from './otp/otp.service';
+import { OtpThrottle } from './otp/otp-throttle';
+import { ScopedTokens } from './otp/scoped-token';
+import { TwilioVerifyClient } from './otp/twilio-verify.client';
+import { PhoneLinkGuard } from './otp/phone-link.guard';
 
 @Module({
   imports: [
@@ -61,8 +67,17 @@ import { ChatModule } from 'src/chats/chats.module';
     UserSubscriptionsModule,
     ChatModule
   ],
-  controllers: [AuthController],
-  providers: [AuthService, UsersService, JwtStrategy],
+  controllers: [AuthController, OtpController],
+  providers: [
+    AuthService,
+    UsersService,
+    JwtStrategy,
+    OtpService,
+    OtpThrottle,
+    ScopedTokens,
+    TwilioVerifyClient,
+    PhoneLinkGuard,
+  ],
   exports: [AuthService],
 })
 export class AuthModule {}

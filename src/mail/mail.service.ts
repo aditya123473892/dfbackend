@@ -1,4 +1,4 @@
-import * as AWS from 'aws-sdk';
+import { SES } from '@aws-sdk/client-ses';
 import { FileHandlebarsAdapter } from 'src/common/adapters';
 import { Injectable } from '@nestjs/common';
 import { ETemplateEmail } from 'src/common/enums';
@@ -54,9 +54,9 @@ export class MailService {
         },
       };
 
-      const SES = new AWS.SES(awsConfig);
+      const client = new SES({ region: awsConfig.region, credentials: { accessKeyId: awsConfig.accessKeyId, secretAccessKey: awsConfig.secretAccessKey } });
 
-      const sendMail = await SES.sendEmail(params).promise();
+      const sendMail = await client.sendEmail(params);
 
       return sendMail;
     } catch (error) {
@@ -112,9 +112,9 @@ export class MailService {
         },
       };
 
-      const SES = new AWS.SES(awsConfig);
+      const client = new SES({ region: awsConfig.region, credentials: { accessKeyId: awsConfig.accessKeyId, secretAccessKey: awsConfig.secretAccessKey } });
 
-      const sendMail = await SES.sendEmail(params).promise();
+      const sendMail = await client.sendEmail(params);
 
       return sendMail;
     } catch (error) {
@@ -132,15 +132,16 @@ export class MailService {
    */
   async resetPassword(to: string, name: string, url: string) {
     try {
-      // Mock if AWS credentials are missing
-      if (!process.env.AWS_ACCESS_KEY || !process.env.AWS_SECRET || !process.env.AWS_SES_REGION) {
-        return { MessageId: "mock-message-id" };
+      if (!process.env.AWS_SES_REGION || !process.env.AWS_MAIL_FROM) {
+        if (['development', 'test'].includes(process.env.NODE_ENV || ''))
+          return { MessageId: 'mock-message-id' };
+        throw new Error('Password reset email delivery is not configured');
       }
       const AWS_MAIL_FROM = process.env.AWS_MAIL_FROM;
 
       const awsConfig = {
-        accessKeyId: process.env.AWS_ACCESS_KEY,
-        secretAccessKey: process.env.AWS_SECRET,
+        accessKeyId: process.env.AWS_ACCESS_KEY || process.env.AWS_ACCESS_KEY_ID,
+        secretAccessKey: process.env.AWS_SECRET || process.env.AWS_SECRET_ACCESS_KEY,
         region: process.env.AWS_SES_REGION,
       };
 
@@ -171,14 +172,19 @@ export class MailService {
         },
       };
 
-      const SES = new AWS.SES(awsConfig);
-
-      const sendMail = await SES.sendEmail(params).promise();
-
-      return sendMail;
-    } catch (error) {
-      console.log('log: error', error);
-      throw new Error(error);
+      if (!!awsConfig.accessKeyId !== !!awsConfig.secretAccessKey)
+        throw new Error('Incomplete mail credential configuration');
+      const client = new SES({ region: awsConfig.region,
+        requestHandler: { connectionTimeout: 5000, requestTimeout: 10000 }, maxAttempts: 2,
+        ...(awsConfig.accessKeyId ? { credentials: {
+          accessKeyId: awsConfig.accessKeyId, secretAccessKey: awsConfig.secretAccessKey,
+          sessionToken: process.env.AWS_SESSION_TOKEN,
+        } } : {}),
+      });
+      return await client.sendEmail(params);
+    } catch {
+      // SDK exceptions may contain recipient and request details.
+      throw new Error('Password reset email delivery failed');
     }
   }
 
@@ -235,8 +241,8 @@ export class MailService {
         },
       };
   
-      const SES = new AWS.SES(awsConfig);
-      const sendMail = await SES.sendEmail(params).promise();
+      const client = new SES({ region: awsConfig.region, credentials: { accessKeyId: awsConfig.accessKeyId, secretAccessKey: awsConfig.secretAccessKey } });
+      const sendMail = await client.sendEmail(params);
   
       return sendMail;
     } catch (error) {
@@ -288,9 +294,9 @@ export class MailService {
         },
       };
 
-      const SES = new AWS.SES(awsConfig);
+      const client = new SES({ region: awsConfig.region, credentials: { accessKeyId: awsConfig.accessKeyId, secretAccessKey: awsConfig.secretAccessKey } });
 
-      const sendMail = await SES.sendEmail(params).promise();
+      const sendMail = await client.sendEmail(params);
 
       return sendMail;
     } catch (error) {
@@ -342,9 +348,9 @@ export class MailService {
         },
       };
 
-      const SES = new AWS.SES(awsConfig);
+      const client = new SES({ region: awsConfig.region, credentials: { accessKeyId: awsConfig.accessKeyId, secretAccessKey: awsConfig.secretAccessKey } });
 
-      const sendMail = await SES.sendEmail(params).promise();
+      const sendMail = await client.sendEmail(params);
 
       return sendMail;
     } catch (error) {
@@ -402,9 +408,9 @@ export class MailService {
         },
       };
 
-      const SES = new AWS.SES(awsConfig);
+      const client = new SES({ region: awsConfig.region, credentials: { accessKeyId: awsConfig.accessKeyId, secretAccessKey: awsConfig.secretAccessKey } });
 
-      const sendMail = await SES.sendEmail(params).promise();
+      const sendMail = await client.sendEmail(params);
 
       return sendMail;
     } catch (error) {
@@ -456,9 +462,9 @@ export class MailService {
         },
       };
 
-      const SES = new AWS.SES(awsConfig);
+      const client = new SES({ region: awsConfig.region, credentials: { accessKeyId: awsConfig.accessKeyId, secretAccessKey: awsConfig.secretAccessKey } });
 
-      const sendMail = await SES.sendEmail(params).promise();
+      const sendMail = await client.sendEmail(params);
 
       return sendMail;
     } catch (error) {

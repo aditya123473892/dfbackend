@@ -5,6 +5,7 @@ import { MongooseModule } from '@nestjs/mongoose';
 import { PostsSchema, Posts } from 'src/common/schemas';
 import { S3BucketService } from 'src/s3-bucket/s3-bucket.service';
 import { AdminPostsController } from './admin-posts/admin-posts.controller';
+import { AdminMediaService } from './admin-posts/admin-media.service';
 import { Comment, CommentSchema } from 'src/common/schemas/comment.schema';
 import { Like, LikeSchema } from 'src/common/schemas/like.schema';
 import { Follow, FollowSchema } from 'src/common/schemas/follow.schema';
@@ -42,7 +43,7 @@ import { PostBookMark, PostBookMarkSchema } from 'src/common/schemas/posts-bookm
     ]),
   ],
   controllers: [PostsController, AdminPostsController],
-  providers: [PostsService, S3BucketService],
+  providers: [PostsService, S3BucketService, AdminMediaService],
   exports: [PostsService],
 })
 export class PostsModule {}

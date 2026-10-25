@@ -31,6 +31,18 @@ export class ChatMessage {
   @Prop({ default: false })
   isRead: boolean;
 
+  @Prop({ default: false })
+  viewOnce: boolean;
+
+  @Prop({ type: Number })
+  viewDurationSeconds?: number;
+
+  @Prop({ type: Date })
+  expiresAt?: Date;
+
+  @Prop({ type: Date })
+  viewedAt?: Date;
+
   @Prop({ type: Date, default: Date.now })
   sentAt: Date;
 }

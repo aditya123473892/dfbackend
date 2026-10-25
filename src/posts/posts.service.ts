@@ -1,4 +1,9 @@
-import { ForbiddenException, Injectable, NotFoundException } from '@nestjs/common';
+import {
+  BadRequestException,
+  ForbiddenException,
+  Injectable,
+  NotFoundException,
+} from '@nestjs/common';
 import { InjectModel } from '@nestjs/mongoose';
 import { Model, SortOrder, Types } from 'mongoose';
 import { CreatePostDto } from './dto/create-post.dto';
@@ -10,9 +15,21 @@ import { Comment, CommentDocument } from 'src/common/schemas/comment.schema';
 import { Like, LikeDocument } from 'src/common/schemas/like.schema';
 import { CreateCommentDto } from './dto/create-comment.dto';
 import { UpdateCommentDto } from './dto/update-comment.dto';
+import { ListCommentsDto } from './dto/list-comments.dto';
+import { createHash } from 'crypto';
+import { pairBlocked } from '../user-blocks/block-context';
+import { visiblePostQuery } from '../user-blocks/visible-post';
+import { preserveMutation } from '../reports/preservation';
+import { EPostStatus, EPostVisibility } from 'src/common/enums/posts.enum';
 import { Follow, FollowStatus } from 'src/common/schemas/follow.schema';
-import { PostRequest, PostRequestDocument } from 'src/common/schemas/posts-request.schema';
-import { PostBookMark, PostBookMarkDocument } from 'src/common/schemas/posts-bookmark.schema';
+import {
+  PostRequest,
+  PostRequestDocument,
+} from 'src/common/schemas/posts-request.schema';
+import {
+  PostBookMark,
+  PostBookMarkDocument,
+} from 'src/common/schemas/posts-bookmark.schema';
 
 interface PostWithCounts extends PostsDocument {
   likeCount: number;
@@ -30,8 +47,10 @@ export class PostsService {
     @InjectModel(Comment.name) private commentModel: Model<CommentDocument>,
     @InjectModel(Like.name) private likeModel: Model<LikeDocument>,
     @InjectModel(Follow.name) private followModel: Model<Follow>,
-    @InjectModel(PostRequest.name) private PostRequestModel: Model<PostRequestDocument>,
-    @InjectModel(PostBookMark.name) private PostBookMarkModel: Model<PostBookMarkDocument>,
+    @InjectModel(PostRequest.name)
+    private PostRequestModel: Model<PostRequestDocument>,
+    @InjectModel(PostBookMark.name)
+    private PostBookMarkModel: Model<PostBookMarkDocument>,
   ) {}
 
   async create(payload: CreatePostDto) {
@@ -62,6 +81,7 @@ export class PostsService {
     _id: string,
     payload: UpdatePostDto,
     user: IAuthUser,
+    expectedVersion?: number,
   ): Promise<PostsDocument | null> {
     const updateFields = {};
     Object.keys(payload).forEach((key) => {
@@ -69,17 +89,21 @@ export class PostsService {
         updateFields[key] = payload[key];
       }
     });
-  
+
     const updatedUser = await this.postsModel
       .findOneAndUpdate(
-        { _id, user: user.id },
-        { $set: updateFields },
+        {
+          _id,
+          user: user.id,
+          ...(expectedVersion === undefined ? {} : { __v: expectedVersion }),
+        },
+        { $set: updateFields, $inc: { __v: 1 } },
         { new: true },
       )
       .exec();
-  
+
     return updatedUser;
-  }  
+  }
 
   async findAll(
     params: FilterPostDto,
@@ -126,7 +150,7 @@ export class PostsService {
       path: 'likes',
       select: 'displayname avatar',
     });
-  
+
     query.populate({
       path: 'comments',
       select: 'content user',
@@ -152,25 +176,23 @@ export class PostsService {
 
   async findAllPublic(
     params: FilterPostDto,
-    authUserId: string, 
+    authUserId: string,
   ): Promise<{ count: number; posts: PostWithFollowStatus[] }> {
     const query = this.postsModel.find();
-  
-  
+
     if (params.visibility) {
       query.where('visibility').equals(params.visibility);
     }
-  
+
     if (params.status) {
       query.where('status').equals(params.status);
     }
-  
-  
+
     query.populate({
       path: 'user',
       select: 'displayname avatar',
     });
-  
+
     query.populate({
       path: 'likes',
       select: 'user',
@@ -179,8 +201,7 @@ export class PostsService {
         select: 'displayname avatar',
       },
     });
-  
-  
+
     query.populate({
       path: 'comments',
       select: 'content user',
@@ -189,16 +210,15 @@ export class PostsService {
         select: 'displayname avatar',
       },
     });
-  
-  
+
     if (params.limit) {
       query.limit(params.limit);
     }
-  
+
     if (params.skip) {
       query.skip(params.skip);
     }
-  
+
     const [posts, count] = await Promise.all([
       query.exec(),
       this.postsModel.countDocuments(query.getQuery()),
@@ -208,32 +228,45 @@ export class PostsService {
       userId: authUserId,
       status: true,
     }).select('postId');
-  
-    const bookmarkedPostIds = new Set(userBookmarks.map((bm) => bm.postId.toString()));
-  
-    const postsWithFollowStatus = await Promise.all(posts.map(async (post) => {
-      const postUserId = (post.user as UsersDocument)._id.toString();
-      const followStatus = await this.getFollowStatusForUser(authUserId, postUserId);
-  
-      return {
-        ...post.toObject(),
-        likeCount: post.likes.length,
-        commentCount: post.comments.length,
-        followStatus,
-        isBookmarked: bookmarkedPostIds.has(post._id.toString())
-      } as unknown as PostWithFollowStatus;
-    }));
-  
-    return { posts: postsWithFollowStatus, count };
-  }    
 
-  async getFollowStatusForUser(followerId: string, followingId: string): Promise<string> {
-    const follow = await this.followModel.findOne({ follower: followerId, following: followingId });
-  
+    const bookmarkedPostIds = new Set(
+      userBookmarks.map((bm) => bm.postId.toString()),
+    );
+
+    const postsWithFollowStatus = await Promise.all(
+      posts.map(async (post) => {
+        const postUserId = (post.user as UsersDocument)._id.toString();
+        const followStatus = await this.getFollowStatusForUser(
+          authUserId,
+          postUserId,
+        );
+
+        return {
+          ...post.toObject(),
+          likeCount: post.likes.length,
+          commentCount: post.comments.length,
+          followStatus,
+          isBookmarked: bookmarkedPostIds.has(post._id.toString()),
+        } as unknown as PostWithFollowStatus;
+      }),
+    );
+
+    return { posts: postsWithFollowStatus, count };
+  }
+
+  async getFollowStatusForUser(
+    followerId: string,
+    followingId: string,
+  ): Promise<string> {
+    const follow = await this.followModel.findOne({
+      follower: followerId,
+      following: followingId,
+    });
+
     if (!follow) {
       return 'None';
     }
-  
+
     if (follow.status === FollowStatus.ACCEPTED) {
       return 'Following';
     } else {
@@ -241,7 +274,6 @@ export class PostsService {
     }
   }
 
-  
   async findById(_id: string) {
     return await this.postsModel.findById(_id);
   }
@@ -254,41 +286,69 @@ export class PostsService {
     return await this.postsModel.findOne(payload);
   }
 
+  async findVisiblePost(id: string, viewer: string) {
+    await this.commentPost(id, viewer);
+    return visiblePostQuery(
+      this.postsModel
+        .findOne({ _id: id })
+        .populate('user', 'displayname avatar'),
+    );
+  }
+
   async remove(_id: string) {
-    return await this.postsModel.deleteOne({ _id });
+    return preserveMutation(this.postsModel.db, [`Posts:${_id}`], () => this.postsModel.deleteOne({ _id }).exec());
   }
 
-  async removePrivate(_id: string, user: string) {
-    return await this.postsModel.deleteOne({ _id, user });
+  async removePrivate(_id: string, user: string, version?: number) {
+    return preserveMutation(this.postsModel.db, [`Posts:${_id}`], async () => await this.postsModel.deleteOne({
+      _id,
+      user,
+      ...(version === undefined ? {} : { __v: version }),
+    }));
   }
-
 
   async getPostBookMark(userId: string) {
     const bookMarks = await this.PostBookMarkModel.find({
       userId,
       status: true,
-    })
-      .populate({
-        path: 'postId',
-        populate: [
-          { path: 'user', select: '_id displayname' },
-          { path: 'likes', select: 'user', populate: { path: 'user', select: 'displayname avatar' } },
-          { path: 'comments', select: 'content user', populate: { path: 'user', select: 'displayname avatar' } }
-        ]
-      });
-  
+    }).populate({
+      path: 'postId',
+      populate: [
+        { path: 'user', select: '_id displayname' },
+        {
+          path: 'likes',
+          select: 'user',
+          populate: { path: 'user', select: 'displayname avatar' },
+        },
+        {
+          path: 'comments',
+          select: 'content user',
+          populate: { path: 'user', select: 'displayname avatar' },
+        },
+      ],
+    });
+
     if (!bookMarks || bookMarks.length === 0) {
       return [];
     }
-  
+
     const enhancedBookMarks = await Promise.all(
       bookMarks.map(async (bookmark) => {
         if (!bookmark.postId) return null;
-  
+
         const post = bookmark.postId as any;
+        try {
+          await this.commentPost(String(post._id), userId);
+        } catch (error) {
+          if (error instanceof ForbiddenException || error instanceof NotFoundException) return null;
+          throw error;
+        }
         const postUserId = post.user._id.toString();
-        const followStatus = await this.getFollowStatusForUser(userId, postUserId);
-  
+        const followStatus = await this.getFollowStatusForUser(
+          userId,
+          postUserId,
+        );
+
         return {
           _id: bookmark._id,
           userId: bookmark.userId,
@@ -300,58 +360,51 @@ export class PostsService {
           },
           status: bookmark.status,
         };
-      })
+      }),
     );
-  
+
     return enhancedBookMarks.filter(Boolean);
   }
-
 
   // async postBookMark(userId: string, postId: string) {
   //   const post = await this.postsModel.findOne({ _id: postId });
   //   if (!post) {
   //     throw new Error('Post not found');
   //   }
-  
+
   //   const existingBookmark = await this.PostBookMarkModel.findOne({
   //     userId,
   //     postId,
   //   });
-  
+
   //   if (existingBookmark) {
   //     throw new Error('Post already bookmarked');
   //   }
-  
+
   //   const newBookmark = new this.PostBookMarkModel({
   //     userId,
   //     postId,
   //     status: true,
   //   });
-  
+
   //   const result = await newBookmark.save();
-  
+
   //   if (!result) {
   //     throw new Error('Failed to create bookmark');
   //   }
-  
+
   //   return result;
   // }
-  
 
   async updatePostBookMarkStatus(userId: string, postId: string) {
-
-    const post = await this.postsModel.findOne({ _id: postId });
-    if (!post) {
-      throw new Error('Post not found');
-    }
+    await this.commentPost(postId, userId);
 
     const existingBookmark = await this.PostBookMarkModel.findOne({
       userId,
       postId,
     });
-  
-    if (!existingBookmark) {
 
+    if (!existingBookmark) {
       const newBookmark = new this.PostBookMarkModel({
         userId,
         postId,
@@ -362,19 +415,17 @@ export class PostsService {
 
       return result;
     }
-  
+
     existingBookmark.status = !existingBookmark.status;
-  
+
     const updatedResult = await existingBookmark.save();
-  
+
     if (!updatedResult) {
       throw new Error('Failed to update bookmark status');
     }
-  
+
     return updatedResult;
   }
-  
-
 
   async findExpiredURLPost(limit: number) {
     // // Calculate the date 5 days ago
@@ -393,73 +444,173 @@ export class PostsService {
   }
 
   async sendPostRequest(requestedUserId: string, userId: string) {
-  
-    const isFollowing = await this.followModel.findOne({ 
-      follower: userId, 
-      following: requestedUserId, 
-      status: "accepted" 
+    if (await pairBlocked(this.postsModel.db, userId, requestedUserId))
+      throw new Error('User not found!');
+    const isFollowing = await this.followModel.findOne({
+      follower: userId,
+      following: requestedUserId,
+      status: 'accepted',
     });
-  
-    const isFollowedBy = await this.followModel.findOne({ 
-      follower: requestedUserId, 
-      following: userId, 
-      status: "accepted" 
+
+    const isFollowedBy = await this.followModel.findOne({
+      follower: requestedUserId,
+      following: userId,
+      status: 'accepted',
     });
-  
+
     if (!isFollowing || !isFollowedBy) {
-      throw new Error("Both users must be mutual followers with an accepted status to send a post request.");
+      throw new Error(
+        'Both users must be mutual followers with an accepted status to send a post request.',
+      );
     }
-  
+
     const postRequest = new this.PostRequestModel({
       userId,
-      requestedUserId
+      requestedUserId,
     });
-  
-    return await postRequest.save();
+
+    const saved = await postRequest.save();
+    if (await pairBlocked(this.postsModel.db, userId, requestedUserId)) {
+      await this.PostRequestModel.updateOne(
+        { _id: saved._id, status: 'pending' },
+        { $set: { status: 'rejected' } },
+      );
+      throw new Error('User not found!');
+    }
+    return saved;
   }
 
-
   async getPendingRequest(userId: string) {
-
     const request = await this.PostRequestModel.find({
       userId: userId,
-      status: "pending"
+      status: 'pending',
     }).populate('requestedUserId');
 
     if (!request || request.length === 0) {
-      throw new Error("No pending requests");
+      throw new Error('No pending requests');
     }
 
     return request;
-
   }
 
-
-  async approvePostEditRequest(userId: string, approverId: string, status: string): Promise<any> {
+  async approvePostEditRequest(
+    userId: string,
+    approverId: string,
+    status: string,
+  ): Promise<any> {
+    if (await pairBlocked(this.postsModel.db, userId, approverId)) return null;
     const startTime = new Date();
     const endTime = new Date(startTime.getTime() + 48 * 60 * 60 * 1000);
 
     const updatedRequest = await this.PostRequestModel.findOneAndUpdate(
-        { userId: approverId, requestedUserId: userId, status: 'pending' },
-        { status, startTime, endTime },
-        { new: true } 
+      { userId: approverId, requestedUserId: userId, status: 'pending' },
+      { status, startTime, endTime },
+      { new: true },
     );
 
-    console.log(updatedRequest,'update')
+    console.log(updatedRequest, 'update');
 
     return updatedRequest;
-}
-  
+  }
 
-  async createComment(createCommentDto: CreateCommentDto): Promise<Comment> {
-    const newComment = new this.commentModel(createCommentDto);
-    await newComment.save();
+  private async commentPost(postId: string, userId: string) {
+    if (!Types.ObjectId.isValid(postId))
+      throw new BadRequestException('Invalid post ID');
+    const post = await this.postsModel.findById(postId);
+    if (!post) throw new NotFoundException('Post not found');
+    const owner = post.user.toString();
+    if (owner === userId) return post;
+    if (post.status === EPostStatus.APPROVED) {
+      if (post.visibility === EPostVisibility.PUBLIC) return post;
+      if (
+        post.visibility === EPostVisibility.FRIENDS &&
+        (await this.followModel.exists({
+          follower: userId,
+          following: owner,
+          status: FollowStatus.ACCEPTED,
+        }))
+      )
+        return post;
+      const now = new Date();
+      if (
+        post.visibility === EPostVisibility.PRIVATE &&
+        (await this.PostRequestModel.exists({
+          userId: owner,
+          requestedUserId: userId,
+          status: 'accepted',
+          startTime: { $lte: now },
+          endTime: { $gte: now },
+        }))
+      )
+        return post;
+    }
+    throw new ForbiddenException('You cannot access comments on this post');
+  }
 
-    const post = await this.postsModel.findById(createCommentDto.post);
-    post.comments.push(newComment);
-    await post.save();
+  async listComments(postId: string, userId: string, params: ListCommentsDto) {
+    await this.commentPost(postId, userId);
+    const filter: any = { post: postId };
+    if (params.before) {
+      const cursor = await this.commentModel
+        .findOne({ _id: params.before, post: postId })
+        .lean();
+      if (!cursor) throw new BadRequestException('Invalid comment cursor');
+      const createdAt = (cursor as any).createdAt;
+      filter.$or = [
+        { createdAt: { $lt: createdAt } },
+        { createdAt, _id: { $lt: cursor._id } },
+      ];
+    }
+    const limit = params.limit ?? 20;
+    const [comments, count] = await Promise.all([
+      this.commentModel
+        .find(filter)
+        .sort({ createdAt: -1, _id: -1 })
+        .limit(limit + 1)
+        .populate('user', 'displayname firstName lastName avatar')
+        .lean(),
+      this.commentModel.countDocuments({ post: postId }),
+    ]);
+    return {
+      comments: comments.slice(0, limit),
+      hasMore: comments.length > limit,
+      count,
+    };
+  }
 
-    return newComment;
+  async createComment(
+    dto: CreateCommentDto & { user: string },
+  ): Promise<Comment> {
+    await this.commentPost(dto.post, dto.user);
+    const content = dto.content.trim();
+    if (!content) throw new BadRequestException('Comment cannot be empty');
+    // A deterministic ID makes concurrent retries safe without a database migration.
+    const id = dto.clientId
+      ? new Types.ObjectId(
+          createHash('sha256')
+            .update(`comment:${dto.user}:${dto.post}:${dto.clientId}`)
+            .digest('hex')
+            .slice(0, 24),
+        )
+      : new Types.ObjectId();
+    let comment: CommentDocument;
+    try {
+      comment = await this.commentModel.create({
+        _id: id,
+        post: dto.post,
+        user: dto.user,
+        content,
+      });
+    } catch (error) {
+      if (error.code !== 11000 || !dto.clientId) throw error;
+      comment = await this.commentModel.findById(id);
+      if (!comment) throw error;
+    }
+    await this.postsModel.updateOne(
+      { _id: dto.post },
+      { $addToSet: { comments: comment._id } },
+    );
+    return comment.populate('user', 'displayname firstName lastName avatar');
   }
 
   async updateComment(
@@ -468,25 +619,37 @@ export class PostsService {
     updateCommentDto: UpdateCommentDto,
     userId: string,
   ): Promise<boolean> {
-    const findComment = await this.commentModel.findOne({ post: postId, _id: commentId, user: userId});
+    const findComment = await this.commentModel.findOne({
+      post: postId,
+      _id: commentId,
+      user: userId,
+    });
+    // Hidden by the block filter or deleted: a missing comment, not a 500.
+    if (!findComment) throw new NotFoundException('Comment not found');
 
-    if ( updateCommentDto.content ) {
+    if (updateCommentDto.content) {
       findComment.content = updateCommentDto.content;
       await findComment.save();
     }
     return true;
   }
 
-  async deleteComment(postId: string, commentId: string, userId: string): Promise<boolean> {
-    const post = await this.postsModel.findById(postId);
-    if (!post) {
-      throw new NotFoundException('Post not found');
-    }
+  async deleteComment(
+    postId: string,
+    commentId: string,
+    userId: string,
+  ): Promise<{ message: string; commentCount: number }> {
+    const post = await this.commentPost(postId, userId);
+
+    if (!Types.ObjectId.isValid(commentId))
+      throw new BadRequestException('Invalid comment ID');
 
     const commentObjectId = new Types.ObjectId(commentId);
 
-    const commentIndex = post.comments.findIndex(comment => comment.toString() === commentObjectId.toString());
-    
+    const commentIndex = post.comments.findIndex(
+      (comment) => comment.toString() === commentObjectId.toString(),
+    );
+
     if (commentIndex === -1) {
       throw new NotFoundException('Comment not found in the post');
     }
@@ -496,25 +659,46 @@ export class PostsService {
       throw new NotFoundException('Comment not found');
     }
 
-    if (comment.user.toString() !== userId) {
+    if (comment.user.toString() !== userId && post.user.toString() !== userId) {
       throw new ForbiddenException('You are not the owner of this comment');
     }
 
-    post.comments.splice(commentIndex, 1);
-    await post.save();
+    await this.postsModel.updateOne(
+      { _id: postId },
+      { $pull: { comments: commentObjectId } },
+    );
 
     await this.commentModel.findByIdAndDelete(commentId);
 
-    return true;
+    return {
+      message: 'Comment deleted successfully',
+      commentCount: await this.commentModel.countDocuments({ post: postId }),
+    };
   }
 
-  async likePost(postId: string, userId: string): Promise<PostsDocument | null> {
+  async getLikeState(postId: string, userId: string) {
+    await this.commentPost(postId, userId);
+    const [likeCount, ownLike] = await Promise.all([
+      this.likeModel.countDocuments({ post: postId }),
+      this.likeModel.exists({ post: postId, user: userId }),
+    ]);
+    return { liked: !!ownLike, likeCount };
+  }
+
+  async likePost(
+    postId: string,
+    userId: string,
+  ): Promise<PostsDocument | null> {
+    await this.commentPost(postId, userId);
     const post = await this.postsModel.findById(postId);
     if (!post) {
       throw new NotFoundException('Post not found');
     }
 
-    const existingLike = await this.likeModel.findOne({ post: postId, user: userId });
+    const existingLike = await this.likeModel.findOne({
+      post: postId,
+      user: userId,
+    });
     if (existingLike) {
       return null;
     }
@@ -528,20 +712,29 @@ export class PostsService {
     return post;
   }
 
-  async unlikePost(postId: string, userId: string): Promise<PostsDocument | null> {
+  async unlikePost(
+    postId: string,
+    userId: string,
+  ): Promise<PostsDocument | null> {
+    await this.commentPost(postId, userId);
     const post = await this.postsModel.findById(postId);
     if (!post) {
       throw new NotFoundException('Post not found');
     }
 
-    const existingLike = await this.likeModel.findOne({ post: postId, user: userId });
+    const existingLike = await this.likeModel.findOne({
+      post: postId,
+      user: userId,
+    });
     if (!existingLike) {
       return null;
     }
 
     await this.likeModel.deleteOne({ _id: existingLike._id });
 
-    post.likes = post.likes.filter(likeId => likeId.toString() !== existingLike._id.toString());
+    post.likes = post.likes.filter(
+      (likeId) => likeId.toString() !== existingLike._id.toString(),
+    );
     await post.save();
 
     return post;

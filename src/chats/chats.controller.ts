@@ -9,13 +9,19 @@ import {
   UseGuards,
   UseInterceptors,
   Body,
+  ValidationPipe,
+  Header,
+  BadRequestException,
 } from '@nestjs/common';
 import { FilesInterceptor } from '@nestjs/platform-express';
 import { ApiBearerAuth, ApiConsumes, ApiTags } from '@nestjs/swagger';
 import { AuthUser } from 'src/common/decorators';
 import { JwtAuthGuard } from 'src/common/guards';
 import { IAuthUser } from 'src/common/interfaces';
-import { successGetRes, successRes } from 'src/common/interceptors/response.handlers';
+import {
+  successGetRes,
+  successRes,
+} from 'src/common/interceptors/response.handlers';
 import { ChatService } from './chats.service';
 import {
   ChatMediaQueryDto,
@@ -34,24 +40,32 @@ export class ChatsController {
     private readonly chatGateway: ChatGateway,
   ) {}
 
+  @Get('messages')
+  async history(
+    @AuthUser() user: IAuthUser,
+    @Query(new ValidationPipe({ whitelist: true, forbidNonWhitelisted: true })) query: ChatMediaQueryDto,
+  ) {
+    if (Boolean(query.receiver) === Boolean(query.groupId))
+      throw new BadRequestException('Choose one conversation');
+    const messages = query.groupId
+      ? await this.chatService.getChatGroupHistory(user.id, query.groupId)
+      : await this.chatService.getChatHistory(user.id, query.receiver);
+    return successGetRes(messages);
+  }
+
   @Post('messages')
-  @ApiConsumes('multipart/form-data')
-  @UseInterceptors(
-    FilesInterceptor('media', Number(process.env.CHAT_MEDIA_MAX_ATTACHMENTS || 5), {
-      limits: { fileSize: Number(process.env.CHAT_MEDIA_MAX_FILE_SIZE || 25 * 1024 * 1024) },
-    }),
-  )
   async createMessage(
     @AuthUser() user: IAuthUser,
-    @Body() dto: CreateChatMessageDto,
-    @UploadedFiles() files: Express.Multer.File[] = [],
+    @Body(new ValidationPipe({ whitelist: true, forbidNonWhitelisted: true }))
+    dto: CreateChatMessageDto,
   ) {
-    const message = await this.chatService.createMediaMessage(user.id, dto, files);
-    this.chatGateway.broadcastSavedMessage(message);
+    const message = await this.chatService.createMediaMessage(user.id, dto);
+    await this.chatGateway.broadcastSavedMessage(message);
     return successRes(message, 'Message sent');
   }
 
   @Post('messages/:messageId/media/:mediaId/access-url')
+  @Header('Cache-Control', 'private, no-store')
   async getAccessUrl(
     @AuthUser() user: IAuthUser,
     @Param('messageId') messageId: string,
@@ -62,14 +76,38 @@ export class ChatsController {
     );
   }
 
+  @Post('messages/:messageId/media/:mediaId/open')
+  @Header('Cache-Control', 'private, no-store')
+  @Header('Pragma', 'no-cache')
+  async openPhoto(
+    @AuthUser() user: IAuthUser,
+    @Param('messageId') messageId: string,
+    @Param('mediaId') mediaId: string,
+  ) {
+    const result = await this.chatService.openRestrictedPhoto(
+      user.id,
+      messageId,
+      mediaId,
+    );
+    await this.chatGateway.broadcastSavedMessage(
+      result.message,
+      'messageUpdated',
+    );
+    return successGetRes(result);
+  }
+
   @Patch('messages/:messageId/media/:mediaId/revoke')
   async revokeMedia(
     @AuthUser() user: IAuthUser,
     @Param('messageId') messageId: string,
     @Param('mediaId') mediaId: string,
   ) {
-    const message = await this.chatService.revokeMedia(user.id, messageId, mediaId);
-    this.chatGateway.broadcastSavedMessage(message, 'messageUpdated');
+    const message = await this.chatService.revokeMedia(
+      user.id,
+      messageId,
+      mediaId,
+    );
+    await this.chatGateway.broadcastSavedMessage(message, 'messageUpdated');
     return successRes(message, 'Media revoked');
   }
 
@@ -86,7 +124,7 @@ export class ChatsController {
       mediaId,
       dto.expiresAt,
     );
-    this.chatGateway.broadcastSavedMessage(message, 'messageUpdated');
+    await this.chatGateway.broadcastSavedMessage(message, 'messageUpdated');
     return successRes(message, 'Media expiration updated');
   }
 
@@ -95,6 +133,8 @@ export class ChatsController {
     @AuthUser() user: IAuthUser,
     @Query() query: ChatMediaQueryDto,
   ) {
-    return successGetRes(await this.chatService.listConversationMedia(user.id, query));
+    return successGetRes(
+      await this.chatService.listConversationMedia(user.id, query),
+    );
   }
 }

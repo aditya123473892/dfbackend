@@ -1,6 +1,15 @@
 import { ApiProperty } from '@nestjs/swagger';
 import { Type } from 'class-transformer';
-import { IsOptional, IsDate, IsString, IsEnum, IsArray, IsNumber, ValidateNested } from 'class-validator';
+import {
+  IsOptional,
+  IsDate,
+  IsString,
+  IsEnum,
+  IsArray,
+  IsNumber,
+  ValidateNested,
+  IsUUID,
+} from 'class-validator';
 import { MediaDto } from 'src/common/dtos/utils.dto/media.dto';
 import { EventType } from 'src/common/schemas/events.schema';
 
@@ -46,9 +55,7 @@ export class UpdateEventDto {
   @IsOptional()
   registrationDeadline: Date;
 
-  @ApiProperty({ type: MediaDto, default: {} })
   @IsOptional()
-  @ValidateNested({ each: false })
-  @Type(() => MediaDto)
-  cover: MediaDto;
+  @IsUUID('4')
+  coverUploadId?: string;
 }
