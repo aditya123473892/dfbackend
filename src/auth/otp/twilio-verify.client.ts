@@ -25,6 +25,10 @@ export function mapTwilioError(error: any): HttpException {
 export class TwilioVerifyClient {
   private readonly client?: Twilio;
   private readonly serviceSid?: string;
+  // TEMPORARY DEV-ONLY fake OTP (revert: delete `fakeCode` and its three uses).
+  // With OTP_DEV_FAKE_CODE set and no Twilio credentials, no SMS is sent and only
+  // that code verifies. Refused outright in production.
+  private readonly fakeCode?: string;
 
   constructor(config: ConfigService) {
     const accountSid = config.get<string>('TWILIO_ACCOUNT_SID');
@@ -32,13 +36,27 @@ export class TwilioVerifyClient {
     this.serviceSid = config.get<string>('TWILIO_VERIFY_SERVICE_SID');
     if (accountSid && authToken && this.serviceSid)
       this.client = new Twilio(accountSid, authToken, { autoRetry: true, maxRetries: 2 });
+    const fake = config.get<string>('OTP_DEV_FAKE_CODE');
+    if (fake) {
+      if (process.env.NODE_ENV === 'production')
+        throw new Error('OTP_DEV_FAKE_CODE must never be set in production');
+      if (!/^\d{6}$/.test(fake)) throw new Error('OTP_DEV_FAKE_CODE must be 6 digits');
+      if (!this.client) {
+        this.fakeCode = fake;
+        Logger.warn('FAKE OTP ENABLED: no SMS is sent; use OTP_DEV_FAKE_CODE', 'TwilioVerifyClient');
+      }
+    }
   }
 
   get configured(): boolean {
-    return Boolean(this.client);
+    return Boolean(this.client || this.fakeCode);
   }
 
   async send(to: string): Promise<void> {
+    if (this.fakeCode) {
+      Logger.warn({ event: 'otp_fake_send', phone: maskPhone(to) }, 'TwilioVerifyClient');
+      return;
+    }
     try {
       await this.service().verifications.create({ to, channel: 'sms' });
     } catch (error) {
@@ -47,6 +65,7 @@ export class TwilioVerifyClient {
   }
 
   async check(to: string, code: string): Promise<VerifyCheckStatus> {
+    if (this.fakeCode) return code === this.fakeCode ? 'approved' : 'pending';
     try {
       return (await this.service().verificationChecks.create({ to, code })).status;
     } catch (error) {

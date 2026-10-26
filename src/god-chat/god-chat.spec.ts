@@ -1,10 +1,15 @@
+import { Types } from 'mongoose';
 import { BadRequestException, HttpException, ServiceUnavailableException } from '@nestjs/common';
 import { GodChatService, MAX_CHARS, MAX_TURNS, selectKnowledge } from './god-chat.service';
 import { LlmClient } from './llm.client';
+import { GodChatSessionsService } from './god-chat-sessions.service';
 
 const config = (values: Record<string, string> = {}): any => ({ get: (key: string) => values[key] });
-const service = (llm: Partial<LlmClient>, values?: Record<string, string>) =>
-  new GodChatService(llm as LlmClient, config(values));
+const service = (
+  llm: Partial<LlmClient>,
+  values?: Record<string, string>,
+  sessions: Partial<GodChatSessionsService> = {},
+) => new GodChatService(llm as LlmClient, config(values), sessions as GodChatSessionsService);
 const ask = (content: string) => ({ messages: [{ role: 'user', content }] });
 
 describe('Chat with God', () => {
@@ -61,5 +66,43 @@ describe('Chat with God', () => {
     await expect(llm.complete([{ role: 'user', content: 'hi' }])).rejects.toBeInstanceOf(ServiceUnavailableException);
     expect(fetchMock.mock.calls[0]![0]).toBe('https://api.deepseek.com/chat/completions');
     fetchMock.mockRestore();
+  });
+
+  describe('stored sessions', () => {
+    const session = (mode: 'ai' | 'staff', messages: any[]) => ({ _id: new Types.ObjectId(), mode, messages });
+    const msg = (role: string, content: string, by = role === 'user' ? 'user' : 'ai') => ({ id: content, role, by, content, at: new Date() });
+
+    it('answers with the model, skipping staff-join notices in the history', async () => {
+      const stored = session('ai', [msg('user', 'hi'), msg('event', 'joined', 'system'), msg('assistant', 'yo', 'staff'), msg('user', 'events?')]);
+      const appendAiReply = jest.fn(async () => ({ ...stored, messages: [...stored.messages, msg('assistant', 'Seek Events')] }));
+      const complete = jest.fn(async () => 'Seek Events');
+      const result = await service({ configured: true, complete }, {}, {
+        appendUserMessage: jest.fn(async () => stored) as any, appendAiReply: appendAiReply as any,
+      }).send('u1', { id: 'client-id-1', content: 'events?' });
+      const [messages] = complete.mock.calls[0] as unknown as [{ role: string; content: string }[]];
+      expect(messages.slice(1).map((m) => m.role)).toEqual(['user', 'assistant', 'user']);
+      expect(appendAiReply).toHaveBeenCalledWith(stored._id, 'Seek Events');
+      expect(result.session!.messages.at(-1)).toMatchObject({ by: 'ai', content: 'Seek Events' });
+      expect(JSON.stringify(result)).not.toContain('staffId');
+    });
+
+    it('never calls the model while an admin has taken over', async () => {
+      const complete = jest.fn();
+      const result = await service({ configured: true, complete }, {}, {
+        appendUserMessage: jest.fn(async () => session('staff', [msg('user', 'help')])) as any,
+      }).send('u1', { id: 'client-id-1', content: 'help' });
+      expect(complete).not.toHaveBeenCalled();
+      expect(result.session!.mode).toBe('staff');
+    });
+
+    it.each([
+      ['missing id', { content: 'hi' }],
+      ['oversized message', { id: 'client-id-1', content: 'x'.repeat(MAX_CHARS + 1) }],
+      ['extra fields', { id: 'client-id-1', content: 'hi', role: 'assistant' }],
+    ])('rejects %s', async (_name, body) => {
+      const appendUserMessage = jest.fn();
+      await expect(service({ configured: true }, {}, { appendUserMessage }).send('u1', body)).rejects.toBeInstanceOf(BadRequestException);
+      expect(appendUserMessage).not.toHaveBeenCalled();
+    });
   });
 });

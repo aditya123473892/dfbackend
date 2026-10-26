@@ -9,6 +9,7 @@ import { ConfigService } from '@nestjs/config';
 import { z } from 'zod';
 import { KNOWLEDGE, type KnowledgeEntry } from './knowledge';
 import { LlmClient, type LlmMessage } from './llm.client';
+import { GodChatSessionsService, type StoredSession } from './god-chat-sessions.service';
 
 export const MAX_TURNS = 12;
 export const MAX_CHARS = 1000;
@@ -28,7 +29,24 @@ const inputSchema = z.object({
     .max(MAX_TURNS),
 }).strict();
 
-const PERSONA = `You are "God", the all-knowing guide inside the DARKFANTASY mobile app.
+export const sendInput = z.object({
+  id: z.string().trim().min(8).max(64).regex(/^[\w-]+$/),
+  content: z.string().trim().min(1).max(MAX_CHARS),
+}).strict();
+
+/** What the member sees: staff ids stay server-side, only "a team member" is disclosed. */
+export function memberView(session: StoredSession | null) {
+  if (!session) return { session: null };
+  return {
+    session: {
+      id: session._id.toHexString(),
+      mode: session.mode,
+      messages: session.messages.map(({ id, role, by, content, at }) => ({ id, role, by, content, at })),
+    },
+  };
+}
+
+const PERSONA =`You are "God", the all-knowing guide inside the DARKFANTASY mobile app.
 Speak with calm, wise, slightly dramatic dark-fantasy flair, but stay brief, warm and practical (at most about 120 words).
 You are an AI assistant, not a real deity, a human or staff member; say so if asked.
 Answer questions about using the app ONLY from the KNOWLEDGE section. If the answer is not there, say you do not know and suggest contacting the DARKFANTASY team.
@@ -58,8 +76,43 @@ export class GodChatService {
   constructor(
     private readonly llm: LlmClient,
     private readonly config: ConfigService,
+    private readonly sessions: GodChatSessionsService,
   ) {}
 
+  session(userId: string) {
+    return this.sessions.findOpen(userId).then(memberView);
+  }
+
+  async newSession(userId: string) {
+    await this.sessions.closeOpen(userId);
+    return memberView(null);
+  }
+
+  /**
+   * Stores the member's message, then answers with the model unless an admin has taken the
+   * session over (their replies arrive when the app refreshes the session). Resending the
+   * same message id after a failure retries the answer without duplicating the message.
+   */
+  async send(userId: string, body: unknown) {
+    const parsed = sendInput.safeParse(body);
+    if (!parsed.success) throw new BadRequestException('Invalid chat request');
+    this.rateLimit(userId);
+    let session = await this.sessions.appendUserMessage(userId, parsed.data.id, parsed.data.content);
+    const history = session.messages.filter((row) => row.role !== 'event');
+    if (session.mode === 'ai' && history[history.length - 1]?.role === 'user') {
+      if (!this.llm.configured) throw new ServiceUnavailableException('Chat with God is not configured');
+      const turns = history.slice(-MAX_TURNS).map(({ role, content }) => ({
+        role: role as 'user' | 'assistant',
+        content: content.slice(0, MAX_REPLY_CHARS),
+      }));
+      while (turns[0]?.role === 'assistant') turns.shift();
+      const reply = await this.complete(turns);
+      session = (await this.sessions.appendAiReply(session._id, reply)) ?? session;
+    }
+    return memberView(session);
+  }
+
+  /** Stateless form kept for app versions released before sessions were stored. */
   async reply(userId: string, body: unknown): Promise<{ reply: string }> {
     if (!this.llm.configured) throw new ServiceUnavailableException('Chat with God is not configured');
     const parsed = inputSchema.safeParse(body);
@@ -68,7 +121,10 @@ export class GodChatService {
     if (history[history.length - 1]!.role !== 'user')
       throw new BadRequestException('The last message must come from the user');
     this.rateLimit(userId);
+    return { reply: await this.complete(history) };
+  }
 
+  private complete(history: LlmMessage[]): Promise<string> {
     const recentQuestions = history.filter((m) => m.role === 'user').slice(-2).map((m) => m.content).join(' ');
     const knowledge = selectKnowledge(recentQuestions)
       .map((entry) => `## ${entry.title}\n${entry.content}`)
@@ -77,7 +133,7 @@ export class GodChatService {
       { role: 'system', content: `${PERSONA}\n\nKNOWLEDGE:\n${knowledge}` },
       ...history,
     ];
-    return { reply: await this.llm.complete(messages) };
+    return this.llm.complete(messages);
   }
 
   /** Per-user sliding window kept in memory; enough for a single API instance. */
