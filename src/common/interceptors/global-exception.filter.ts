@@ -4,6 +4,7 @@ import {
   ArgumentsHost,
   HttpStatus,
   Logger,
+  HttpException,
 } from '@nestjs/common';
 import { Response } from 'express';
 import { successRes } from './response.handlers';
@@ -11,7 +12,10 @@ import { successRes } from './response.handlers';
 @Catch()
 export default class GlobalExceptionFilter implements ExceptionFilter {
   catch(error: any, host: ArgumentsHost) {
-    Logger.error(`GlobalExceptionFilter: ${error.message}`);
+    Logger.error({
+      event: 'request_failed',
+      type: error?.constructor?.name || 'Error',
+    });
 
     // Return success response when status code is 200
     if (error?.response?.status === 200) {
@@ -22,14 +26,19 @@ export default class GlobalExceptionFilter implements ExceptionFilter {
     const response = ctx.getResponse<Response>();
 
     const status =
-      error?.response?.statusCode || HttpStatus.INTERNAL_SERVER_ERROR;
+      error instanceof HttpException
+        ? error.getStatus()
+        : HttpStatus.INTERNAL_SERVER_ERROR;
 
     response.status(status).json({
       statusCode: status,
       error: error?.response?.error || error.name,
-      message: error?.response?.message
-        ? error?.response?.message
-        : error.message || 'Internal Server Error',
+      message:
+        status >= 500
+          ? 'The server could not complete this request'
+          : error?.response?.message
+            ? error?.response?.message
+            : error.message || 'Internal Server Error',
     });
   }
 }

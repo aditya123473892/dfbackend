@@ -1,3 +1,4 @@
+import { createHash } from 'crypto';
 import { MongoMemoryReplSet } from 'mongodb-memory-server';
 import mongoose, { Connection, Model, Types } from 'mongoose';
 import { UsersSchema } from 'src/common/schemas/users.schema';
@@ -14,6 +15,7 @@ import { ChatReadCursorSchema } from 'src/common/schemas/chat-read-cursor.schema
 import { ChatService } from 'src/chats/chats.service';
 import { GroupService } from 'src/group-chat/group.service';
 import { PostsService } from 'src/posts/posts.service';
+import { unblockedPolicy } from 'src/user-blocks/block.fixture';
 
 /**
  * Real MongoDB (in-memory replica set) with the application's schemas and
@@ -29,6 +31,20 @@ export class Harness {
     uploadPrivateFile: jest.fn(async () => ({ Key: 'stored' })),
     uploadFile: jest.fn(async () => ({ Key: 'posts/stored', key: 'posts/stored' })),
   };
+  // Photo pipeline: deletions are queued, never performed inline.
+  photos = {
+    enqueue: jest.fn(async () => undefined),
+    release: jest.fn(async () => undefined),
+    retire: jest.fn(async () => undefined),
+    bind: jest.fn(async () => []),
+    accessUrl: jest.fn(async (key: string) => `https://signed.example/${key}`),
+    // Deterministic message id per (owner, clientId, conversation), like the real reservation.
+    reserveChatMessage: jest.fn(async (owner: string, key: string, target: string) =>
+      createHash('sha256').update(`${owner}:${key}:${target}`).digest('hex').slice(0, 24),
+    ),
+    failedChatSend: jest.fn(async () => undefined),
+  };
+  blocks = unblockedPolicy();
   gateway = {
     syncGroupMembership: jest.fn(),
     broadcastGroupDeleted: jest.fn(),
@@ -62,11 +78,14 @@ export class Harness {
     }
     const m = this.models;
     this.chat = new ChatService(
-      m.ChatMessage, m.Users, m.Group, m.ChatMediaAudit, this.s3 as any, m.ChatReadCursor,
+      m.ChatMessage, m.Users, m.Group, m.ChatMediaAudit, this.s3 as any,
+      this.photos as any, this.blocks, m.ChatReadCursor,
     );
-    this.groups = new GroupService(m.Group, m.Users, this.chat, this.gateway as any, this.s3 as any);
+    this.groups = new GroupService(
+      m.Group, m.Users, this.chat, this.gateway as any, this.blocks, this.photos as any,
+    );
     this.posts = new PostsService(
-      m.Posts, m.Comment, m.Like, m.Follow, m.PostRequest, m.PostBookMark, this.s3 as any,
+      m.Posts, m.Comment, m.Like, m.Follow, m.PostRequest, m.PostBookMark,
     );
   }
 

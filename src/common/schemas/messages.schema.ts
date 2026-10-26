@@ -26,7 +26,7 @@ export class Messages {
   @Prop({ required: false })
   body: string;
 
-  @Prop({
+  @Prop({ type: String,
     enum: EMessageBodyType,
     required: true,
     default: EMessageBodyType.TEXT,
@@ -36,7 +36,7 @@ export class Messages {
   @Prop({ type: [Media], required: true })
   media: Media[];
 
-  @Prop({
+  @Prop({ type: String,
     enum: EMessageStatus,
     required: true,
     default: EMessageStatus.SENT,

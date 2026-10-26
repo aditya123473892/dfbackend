@@ -1,4 +1,4 @@
-FROM node:18-slim
+FROM node:22-slim
 
 WORKDIR /app
 
@@ -13,21 +13,12 @@ RUN apt-get update \
 COPY package.json package-lock.json ./
 RUN npm ci
 
-# Copy the rest of the source (scripts/ + mongo_DF/ needed for the seed service)
+# Copy source; credentials, local uploads and database dumps stay outside images.
 COPY . .
 
-# Default DB points at the compose `mongo` service; compose overrides via environment.
-ARG DATABASE_URL=mongodb://root:password@mongo:27017/?authSource=admin
-ENV NODE_ENV=production \
-  PORT=9000 \
-  DATABASE_URL=${DATABASE_URL} \
-  DATABASE_NAME=darkfantasy \
-  JWT_SECRET=development-jwt-secret-change-me \
-  EXPIRES_IN=7d \
-  PASSWORD_ENCRYPTION_PRIVATE_KEY=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef \
-  PUBLIC_SITE_DOMAIN=http://localhost:3000 \
-  ADMIN_SITE_DOMAIN=http://localhost:3000 \
-  AWS_DEFAULT_S3_BUCKET=dark-fantacy-dev
+# Supply database credentials and signing/encryption secrets at deployment.
+# No production credential defaults are baked into the image.
+ENV NODE_ENV=production PORT=9000
 
 RUN npm run build
 

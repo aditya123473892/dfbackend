@@ -1,4 +1,6 @@
 import { ChatGateway } from './chats.gateway';
+import { Subject } from 'rxjs';
+import { unblockedPolicy } from '../user-blocks/block.fixture';
 
 const userId = '507f1f77bcf86cd799439011';
 const receiverId = '507f1f77bcf86cd799439012';
@@ -9,6 +11,7 @@ function socket(overrides: any = {}) {
     data: {},
     handshake: { auth: { token: 'valid-token' } },
     join: jest.fn(),
+    use: jest.fn(),
     emit: jest.fn(),
     disconnect: jest.fn(),
     ...overrides,
@@ -23,7 +26,9 @@ function makeGateway() {
     updateUserStatus: jest.fn().mockResolvedValue(undefined),
     assertCanSendDirect: jest.fn().mockResolvedValue(true),
     assertGroupMember: jest.fn().mockResolvedValue(true),
-    saveTextMessage: jest.fn().mockImplementation(async (data) => ({ _id: 'm1', ...data })),
+    saveTextMessage: jest
+      .fn()
+      .mockImplementation(async (data) => ({ _id: 'm1', ...data })),
     getUnreadMessageCount: jest.fn().mockResolvedValue([]),
     getChatHistory: jest.fn().mockResolvedValue([]),
     getChatGroupHistory: jest.fn().mockResolvedValue([]),
@@ -31,16 +36,58 @@ function makeGateway() {
     updateMessage: jest.fn(),
     deleteMessage: jest.fn(),
   };
-  const jwt: any = { verifyAsync: jest.fn().mockResolvedValue({ sub: userId }) };
-  const gateway = new ChatGateway(chatService, jwt);
+  const jwt: any = {
+    verifyAsync: jest.fn().mockResolvedValue({ sub: userId }),
+  };
+  const photos: any = {
+    assertActiveAccount: jest.fn().mockResolvedValue(undefined),
+    accountDeletion$: new Subject<string>(),
+  };
+  const gateway = new ChatGateway(chatService, jwt, photos, unblockedPolicy());
   gateway.server = {
     to: jest.fn().mockReturnValue({ emit: jest.fn() }),
     emit: jest.fn(),
+    in: jest.fn().mockReturnValue({ disconnectSockets: jest.fn() }),
+    use: jest.fn(),
   } as any;
-  return { gateway, chatService, jwt };
+  return { gateway, chatService, jwt, photos };
 }
 
 describe('ChatGateway authentication and identity', () => {
+  it('rejects an account disabled after its JWT was issued', async () => {
+    const { gateway, photos } = makeGateway();
+    photos.assertActiveAccount.mockRejectedValue(
+      new Error('Account unavailable'),
+    );
+    const client = socket();
+    await gateway.handleConnection(client);
+    expect(client.disconnect).toHaveBeenCalledWith(true);
+    expect(client.data.userId).toBeUndefined();
+  });
+
+  it('rechecks current account state on packets from an already-connected socket', async () => {
+    const { gateway, photos } = makeGateway();
+    const client = socket();
+    await gateway.handleConnection(client);
+    photos.assertActiveAccount.mockRejectedValue(
+      new Error('Account unavailable'),
+    );
+    const next = jest.fn();
+    await client.use.mock.calls[0][0]([], next);
+    expect(client.disconnect).toHaveBeenCalledWith(true);
+    expect(next).not.toHaveBeenCalled();
+  });
+
+  it('disconnects the account room when account deletion is requested', () => {
+    const { gateway, photos } = makeGateway();
+    gateway.afterInit(gateway.server);
+    photos.accountDeletion$.next(userId);
+    expect(gateway.server.in).toHaveBeenCalledWith(`user:${userId}`);
+    expect(
+      gateway.server.in(`user:${userId}`).disconnectSockets,
+    ).toHaveBeenCalledWith(true);
+  });
+
   it('authenticates the socket JWT and stores the verified identity', async () => {
     const { gateway } = makeGateway();
     const client = socket();
@@ -62,20 +109,29 @@ describe('ChatGateway authentication and identity', () => {
     const { gateway, chatService } = makeGateway();
     const client = socket({ data: { userId } });
     await gateway.handleSendMessage(
-      { sender: '507f1f77bcf86cd799439099', receiver: receiverId, message: 'hello' } as any,
+      {
+        sender: '507f1f77bcf86cd799439099',
+        receiver: receiverId,
+        message: 'hello',
+      } as any,
       client,
     );
-    expect(chatService.saveTextMessage).toHaveBeenCalledWith(expect.objectContaining({
-      sender: userId,
-      receiver: receiverId,
-    }));
+    expect(chatService.saveTextMessage).toHaveBeenCalledWith(
+      expect.objectContaining({
+        sender: userId,
+        receiver: receiverId,
+      }),
+    );
   });
 
   it('authorizes group membership before joining a room', async () => {
     const { gateway, chatService } = makeGateway();
     const client = socket({ data: { userId } });
     await gateway.handleJoinGroup(client, receiverId);
-    expect(chatService.assertGroupMember).toHaveBeenCalledWith(userId, receiverId);
+    expect(chatService.assertGroupMember).toHaveBeenCalledWith(
+      userId,
+      receiverId,
+    );
     expect(client.join).toHaveBeenCalledWith(`group:${receiverId}`);
   });
 });
@@ -106,35 +162,35 @@ describe('ChatGateway realtime delivery', () => {
     expect(client.join).toHaveBeenCalledWith([`group:${groupA}`, `group:${groupB}`]);
   });
 
-  it('relays group typing only from sockets in that group room, excluding the sender', () => {
+  it('relays group typing only from sockets in that group room, excluding the sender', async () => {
     const { gateway } = makeGateway();
     const roomEmit = jest.fn();
     const member = socket({ data: { userId }, rooms: new Set([`group:${groupA}`]), to: jest.fn(() => ({ emit: roomEmit })) });
-    gateway.handleTyping({ groupId: groupA }, member);
+    await gateway.handleTyping({ groupId: groupA }, member);
     expect(member.to).toHaveBeenCalledWith(`group:${groupA}`);
     expect(roomEmit).toHaveBeenCalledWith('typing', { sender: userId, groupId: groupA, isTyping: true });
 
     const outsider = socket({ data: { userId }, rooms: new Set(), to: jest.fn(() => ({ emit: roomEmit })) });
-    gateway.handleTyping({ groupId: groupB }, outsider);
+    await gateway.handleTyping({ groupId: groupB }, outsider);
     expect(outsider.to).not.toHaveBeenCalled();
   });
 
-  it('relays direct typing to the receiver and ignores invalid or self targets', () => {
+  it('relays direct typing to the receiver and ignores invalid or self targets', async () => {
     const { gateway } = makeGateway();
     const { server, emits } = recordingServer();
     gateway.server = server;
     const client = socket({ data: { userId } });
-    gateway.handleTyping({ receiver: receiverId, isTyping: false }, client);
-    gateway.handleTyping({ receiver: 'not-an-id' }, client);
-    gateway.handleTyping({ receiver: userId }, client);
+    await gateway.handleTyping({ receiver: receiverId, isTyping: false }, client);
+    await gateway.handleTyping({ receiver: 'not-an-id' }, client);
+    await gateway.handleTyping({ receiver: userId }, client);
     expect(emits).toEqual([{ rooms: `user:${receiverId}`, event: 'typing', payload: { sender: userId, isTyping: false } }]);
   });
 
-  it('sends direct messages once to both participants', () => {
+  it('sends direct messages once to both participants', async () => {
     const { gateway } = makeGateway();
     const { server, emits } = recordingServer();
     gateway.server = server;
-    gateway.broadcastSavedMessage({ _id: 'm1', sender: userId, receiver: receiverId });
+    await gateway.broadcastSavedMessage({ _id: 'm1', sender: userId, receiver: receiverId });
     expect(emits).toEqual([
       { rooms: [`user:${userId}`, `user:${receiverId}`], event: 'receiveMessage', payload: expect.anything() },
     ]);

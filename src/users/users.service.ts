@@ -1,4 +1,9 @@
-import { Injectable } from '@nestjs/common';
+import { BadRequestException, Injectable } from '@nestjs/common';
+import { authorizeRoleGrant, changeRoles, protectLastRoot, validateRoles } from './role-policy';
+import { preservationGate } from '../reports/preservation';
+import { BlockService } from '../user-blocks/block.service';
+import { referenceId } from '../user-blocks/block-context';
+import { visiblePostQuery } from '../user-blocks/visible-post';
 import { ObjectId } from 'mongodb';
 import { CreateUserDto, FilterUsersDto, UpdateUserDto } from './dtos';
 import { InjectModel } from '@nestjs/mongoose';
@@ -19,11 +24,10 @@ import {
   UserBookMark,
   UserBookMarkDocument,
 } from 'src/common/schemas/user-bookmark.schema';
-import { 
-  ChatMessage, 
-  ChatMessageDocument
+import {
+  ChatMessage,
+  ChatMessageDocument,
 } from 'src/common/schemas/chats.schema';
-import { anyId } from 'src/chats/chats.service';
 
 // Never returned by any user endpoint.
 const SECRET_FIELDS = [
@@ -37,27 +41,14 @@ const SECRET_FIELDS = [
 const PRIVATE_FIELDS = [
   'username',
   'phoneNumber',
+  'phoneE164',
+  'phoneVerifiedAt',
   'loginCount',
   'lastLogin',
   'blockedBy',
   'blockedTime',
   'canEditProfile',
 ];
-// What a user may change on their own profile through PATCH /users/me.
-export const SELF_EDITABLE_FIELDS = [
-  'displayname',
-  'firstName',
-  'lastName',
-  'bio',
-  'intrests',
-  'gender',
-  'age',
-  'phoneNumber',
-  'city',
-  'state',
-  'country',
-];
-
 const escapeRegex = (value: string) => value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 const searchPattern = (value: string) =>
   new RegExp(escapeRegex(String(value).slice(0, 100)).replace(/\s+/g, '\\s+'), 'i');
@@ -87,6 +78,7 @@ export class UsersService {
     private BookMarkModel: Model<UserBookMarkDocument>,
     @InjectModel(ChatMessage.name)
     private chatMessageModel: Model<ChatMessageDocument>,
+    private readonly blocks: BlockService,
   ) {}
 
   async findByUsername(username: string) {
@@ -95,7 +87,41 @@ export class UsersService {
     });
   }
 
-  async create(createUserDto: CreateUserDto) {
+  async findByVerifiedPhone(phoneE164: string) {
+    return await this.usersModel.findOne({
+      phoneE164,
+      phoneVerifiedAt: { $ne: null },
+    });
+  }
+
+  /** Raw driver read: viewer blocks and restrictions must not hide an existing owner. */
+  async phoneOwnerId(phoneE164: string): Promise<string | null> {
+    const owner = await this.usersModel.collection.findOne(
+      { phoneE164 },
+      { projection: { _id: 1 } },
+    );
+    return owner ? String(owner._id) : null;
+  }
+
+  /** Links a number already proven by OTP. Returns false when another account holds it. */
+  async setVerifiedPhone(_id: string, phoneE164: string): Promise<boolean> {
+    const owner = await this.phoneOwnerId(phoneE164);
+    if (owner && owner !== String(_id)) return false;
+    try {
+      await this.updateOne(_id, { phoneE164, phoneVerifiedAt: new Date() });
+      return true;
+    } catch (error) {
+      if (error?.code === 11000 && error?.keyPattern?.phoneE164) return false;
+      throw error;
+    }
+  }
+
+  async create(createUserDto: CreateUserDto, actorId?: string) {
+    if ('premiumUntil' in createUserDto) throw new BadRequestException('Entitlements are server managed');
+    validateRoles(createUserDto.roles);
+    if (actorId) await authorizeRoleGrant(this.usersModel.db, actorId, createUserDto.roles);
+    else if (createUserDto.roles.some((role) => role !== ERole.USER))
+      throw new BadRequestException('Staff creation requires an authorized actor');
     const createUser = new this.usersModel(createUserDto);
 
     return await createUser.save();
@@ -103,8 +129,20 @@ export class UsersService {
 
   async updateOne(
     _id: string,
-    updateUserDto: UpdateUserDto,
+    updateUserDto: Partial<UpdateUserDto> & Record<string, any>,
+    actorId?: string,
   ): Promise<UsersDocument | null> {
+    return preservationGate(this.usersModel.db, async () => {
+    if ('premiumUntil' in updateUserDto) throw new BadRequestException('Entitlements are server managed');
+    if (Object.keys(updateUserDto).some((key) => key.startsWith('$') || key.includes('.')))
+      throw new BadRequestException('Invalid update fields');
+    if (updateUserDto.isBlocked === true || updateUserDto.deletionRequestedAt || new Date(updateUserDto.moderationSuspendedUntil) > new Date())
+      await protectLastRoot(this.usersModel.db, _id);
+    if (Object.prototype.hasOwnProperty.call(updateUserDto, 'roles')) {
+      await changeRoles(this.usersModel.db, actorId, _id, updateUserDto.roles);
+      updateUserDto = { ...updateUserDto };
+      delete updateUserDto.roles;
+    }
     const updateFields = {};
     Object.keys(updateUserDto).forEach((key) => {
       if (updateUserDto[key] !== undefined) {
@@ -113,10 +151,11 @@ export class UsersService {
     });
 
     const updatedUser = await this.usersModel
-      .findOneAndUpdate({ _id }, { $set: updateFields }, { new: true })
+      .findOneAndUpdate({ _id }, { $set: updateFields }, { new: true, runValidators: true })
       .exec();
 
     return updatedUser;
+    });
   }
 
   async findAll(params: FilterUsersDto) {
@@ -166,10 +205,13 @@ export class UsersService {
 
     const usersWithPosts = await Promise.all(
       users.map(async (user) => {
-        const userPosts = await this.postModel
-          .find({ user: user._id, visibility: EPostVisibility.PUBLIC, status: EPostStatus.APPROVED })
-          .sort({ createdAt: -1 })
-          .exec();
+        const userPosts = await visiblePostQuery(
+          this.postModel.find({
+            user: user._id,
+            visibility: EPostVisibility.PUBLIC,
+            status: EPostStatus.APPROVED,
+          }),
+        ).exec();
 
         return {
           ...user.toObject(),
@@ -186,9 +228,13 @@ export class UsersService {
 
     if (!user) return null;
 
-    const userPosts = await this.postModel
-      .find({ user: _id, visibility: EPostVisibility.PUBLIC })
-      .exec();
+    const userPosts = await visiblePostQuery(
+      this.postModel.find({
+        user: _id,
+        visibility: EPostVisibility.PUBLIC,
+        status: EPostStatus.APPROVED,
+      }),
+    ).exec();
 
     return {
       ...user.toObject(),
@@ -228,20 +274,28 @@ export class UsersService {
 
     if (hasAccess) {
       query = {
-        user: id,
-        status: EPostStatus.APPROVED,
-        visibility: { $in: [EPostVisibility.PUBLIC, EPostVisibility.PRIVATE] },
+        $or: [
+          {
+            user: id,
+            visibility: EPostVisibility.PUBLIC,
+            status: EPostStatus.APPROVED,
+          },
+          {
+            user: id,
+            visibility: EPostVisibility.PRIVATE,
+            status: EPostStatus.APPROVED,
+          },
+        ],
       };
     } else {
-      query = { user: id, visibility: EPostVisibility.PUBLIC, status: EPostStatus.APPROVED };
+      query = {
+        user: id,
+        visibility: EPostVisibility.PUBLIC,
+        status: EPostStatus.APPROVED,
+      };
     }
 
-    // Like owners let clients show whether the viewer liked each post.
-    const userPosts = await this.postModel
-      .find(query)
-      .sort({ createdAt: -1 })
-      .populate({ path: 'likes', select: 'user' })
-      .exec();
+    const userPosts = await visiblePostQuery(this.postModel.find(query)).exec();
 
     return {
       ...user.toObject(),
@@ -285,7 +339,7 @@ export class UsersService {
   async findOneWithPassword(username: string): Promise<UsersDocument | null> {
     return await this.usersModel
       .findOne({ username: username })
-      .select('password roles');
+      .select('password roles username isBlocked moderationSuspendedUntil deletionRequestedAt');
   }
 
   async updatePassword(
@@ -294,7 +348,7 @@ export class UsersService {
   ): Promise<UsersDocument | null> {
     let user = await this.usersModel.findById(_id);
     user.password = password;
-    (user.passwordResetTokenUsed = true), (user.passwordResetToken = null);
+    ((user.passwordResetTokenUsed = true), (user.passwordResetToken = null));
     return await user.save();
   }
 
@@ -319,6 +373,7 @@ export class UsersService {
     _id: string,
     updateUserDto: UpdateUserProfileDto,
   ): Promise<UsersDocument | null> {
+    if ('premiumUntil' in updateUserDto) throw new BadRequestException('Entitlements are server managed');
     const updateFields: Record<string, any> = {};
 
     Object.entries(updateUserDto).forEach(([key, value]) => {
@@ -474,6 +529,12 @@ export class UsersService {
     followerId: string,
     followingId: string,
   ): Promise<Follow> {
+    if (
+      !ObjectId.isValid(followingId) ||
+      !(await this.usersModel.exists({ _id: followingId }))
+    )
+      throw new Error('User not found!');
+    await this.blocks.assertVisible(followerId, followingId);
     const existingFollow = await this.followModel.findOne({
       follower: followerId,
       following: followingId,
@@ -487,22 +548,42 @@ export class UsersService {
       following: followingId,
       status: FollowStatus.PENDING,
     });
-    return await follow.save();
+    const saved = await follow.save();
+    if (await this.blocks.isBlockedEitherWay(followerId, followingId)) {
+      await this.followModel.updateOne(
+        { _id: saved._id, status: FollowStatus.PENDING },
+        { $set: { status: FollowStatus.REJECTED } },
+      );
+      throw new Error('User not found!');
+    }
+    return saved;
   }
 
   async approveFollowRequest(
     followId: string,
     status: FollowStatus,
+    actorId: string,
   ): Promise<Follow> {
     const follow = await this.followModel.findById(followId);
-    if (!follow) {
+    if (
+      !follow ||
+      String(follow.following) !== actorId ||
+      follow.status !== FollowStatus.PENDING
+    ) {
       throw new Error('Follow request not found');
     }
 
-    follow.status = status;
-    await follow.save();
-
-    return follow;
+    if (![FollowStatus.ACCEPTED, FollowStatus.REJECTED].includes(status))
+      throw new Error('Invalid follow status');
+    await this.blocks.assertVisible(actorId, String(follow.follower));
+    const updated = await this.followModel.findOneAndUpdate(
+      { _id: followId, following: actorId, status: FollowStatus.PENDING },
+      { $set: { status } },
+      { new: true },
+    );
+    if (!updated) throw new Error('Follow request not found');
+    await this.blocks.assertVisible(actorId, String(follow.follower));
+    return updated;
   }
 
   async unfollowUser(followerId: string, followingId: string): Promise<Follow> {
@@ -572,11 +653,14 @@ export class UsersService {
     _id: string,
     isBlocked: boolean,
   ): Promise<UsersDocument | null> {
+    return preservationGate(this.usersModel.db, async () => {
+    if (isBlocked) await protectLastRoot(this.usersModel.db, _id);
     return await this.usersModel.findByIdAndUpdate(
       _id,
       { $set: { isBlocked } },
       { new: true },
     );
+    });
   }
 
   async findUsers() {
@@ -599,41 +683,38 @@ export class UsersService {
   }
 
   async getUserChatList(userId: string) {
-  
     const userObjectId = new ObjectId(userId);
-  
-    // Legacy endpoint (the app now uses GET /chats/conversations). Ids may be
-    // stored as strings or ObjectIds.
+
     const userChatList = await this.chatMessageModel.find({
       groupId: null,
-      $or: [{ sender: anyId(userId) }, { receiver: anyId(userId) }],
-    }).select('sender receiver');
-  
-    const uniqueUsers = new Set<string>();
-
-    userChatList.forEach(chat => {
-        if (chat.sender && chat.sender.toString() !== userId) {
-            uniqueUsers.add(chat.sender.toString());
-        }
-        if (chat.receiver && chat.receiver.toString() !== userId) {
-            uniqueUsers.add(chat.receiver.toString());
-        }
+      $or: [{ sender: referenceId(userId) }, { receiver: referenceId(userId) }],
     });
 
+    const uniqueUsers = new Set<string>();
+
+    userChatList.forEach((chat) => {
+      if (chat.sender && chat.sender.toString() !== userId) {
+        uniqueUsers.add(chat.sender.toString());
+      }
+      if (chat.receiver && chat.receiver.toString() !== userId) {
+        uniqueUsers.add(chat.receiver.toString());
+      }
+    });
 
     // Fetch user details for the unique user IDs
     if (uniqueUsers.size === 0) return []; // No users found, return empty array
 
-    const users = await this.usersModel.find({
-        _id: { $in: Array.from(uniqueUsers).map(id => new ObjectId(id)) }
-    }).select('_id displayname avatar firstName lastName');
+    const users = await this.usersModel
+      .find({
+        _id: { $in: Array.from(uniqueUsers).map((id) => new ObjectId(id)) },
+      })
+      .select('_id displayname avatar username firstName lastName');
 
     return users;
   }
-  
+
   async findAdmin() {
-    const query = this.usersModel.find({roles: ERole.ADMIN});
+    const query = this.usersModel.find({ roles: ERole.ADMIN });
     return query;
   }
-
 }

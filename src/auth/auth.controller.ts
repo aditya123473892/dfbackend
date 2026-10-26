@@ -17,7 +17,8 @@ import {
   unAuthorizedRes,
 } from 'src/common/interceptors';
 import { ApiBearerAuth, ApiTags } from '@nestjs/swagger';
-import { JwtAuthGuard, RolesGuard } from 'src/common/guards';
+import { isMobileClient, JwtAuthGuard, RolesGuard } from 'src/common/guards';
+import { otpError } from './otp/otp-errors';
 import { AuthUser, Roles } from 'src/common/decorators';
 import { IAuthUser } from 'src/common/interfaces';
 import { decrypt, encrypt } from 'src/common/functions';
@@ -35,7 +36,10 @@ export class AuthController {
   ) {}
 
   @Post('login')
-  async login(@Body() credentials: LoginDto) {
+  async login(@Body() credentials: LoginDto, @Req() request?: any) {
+    // Mobile signs in with phone OTP only; existing users use /auth/phone/bootstrap once.
+    if (isMobileClient(request)) throw otpError('PHONE_LOGIN_REQUIRED');
+
     const foundUser = await this.userService.findByUsername(
       credentials.username,
     );
@@ -82,6 +86,8 @@ export class AuthController {
     }
 
     // Create Token
+    // The response presenter may expose self-only fields only after authentication.
+    if (request) request.user = { id: String(user._id) };
     const { accessToken, cookieToken } =
       await this.authService.createTokens(user);
 
@@ -97,7 +103,9 @@ export class AuthController {
   }
 
   @Post('signup')
-  async signUp(@Body() createUserDto: CreateUserDto) {
+  async signUp(@Body() createUserDto: CreateUserDto, @Req() request?: any) {
+    // Mobile signups verify the phone first: /auth/otp/signup/verify then /auth/otp/signup.
+    if (isMobileClient(request)) throw otpError('PHONE_LOGIN_REQUIRED');
     try {
       const foundUser = await this.userService.findByUsername(
         createUserDto.username,
@@ -115,7 +123,17 @@ export class AuthController {
 
       // Create user
       const user = await this.userService.create({
-        ...createUserDto,
+        username: createUserDto.username,
+        password: createUserDto.password,
+        firstName: createUserDto.firstName,
+        lastName: createUserDto.lastName,
+        age: createUserDto.age,
+        gender: createUserDto.gender,
+        phoneNumber: createUserDto.phoneNumber,
+        roles: [ERole.USER],
+        isEmailVerified: false,
+        passwordResetToken: undefined,
+        passwordResetTokenUsed: false,
         displayname,
       });
 
@@ -142,8 +160,14 @@ export class AuthController {
         // url,
       );
       // Mock email verification in development
-      if (!process.env.AWS_ACCESS_KEY || !process.env.AWS_SECRET || !process.env.AWS_SES_REGION) {
-        await this.userService.updateOne(user._id.toString(), { isEmailVerified: true });
+      if (
+        !process.env.AWS_ACCESS_KEY ||
+        !process.env.AWS_SECRET ||
+        !process.env.AWS_SES_REGION
+      ) {
+        await this.userService.updateOne(user._id.toString(), {
+          isEmailVerified: true,
+        });
       }
 
       if (!sendEmail) return badRequestRes(`Unable to verification email`);
@@ -199,12 +223,10 @@ export class AuthController {
   async forgotPassword(@Body() { username }: ForgotPasswordDto) {
     const user = await this.userService.findOne({ username });
 
-    if (!user)
-      return badRequestRes(
-        `No user exist with this '${username}' username or email!`,
-      );
-
-    if (user.isBlocked) return badRequestRes(`Account blocked!`);
+    const accepted = () => successRes(
+      { passwordRequest: true }, 'If an account exists, reset instructions have been sent.',
+    );
+    if (!user || user.isBlocked || user.deletionRequestedAt) return accepted();
 
     //TODO: Generate a token for user with expiry
     const currentDate = new Date();
@@ -240,10 +262,7 @@ export class AuthController {
 
     if (!SendEmail) return badRequestRes(`Unable to send link`);
 
-    return successRes(
-      { passwordRequest: true },
-      'Password reset link has been sent your email!',
-    );
+    return accepted();
   }
 
   @Post('reset-password')

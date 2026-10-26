@@ -52,7 +52,7 @@ describe('Groups (MongoDB integration)', () => {
       LimitedGroupService = require('src/group-chat/group.service').GroupService;
     });
     delete process.env.GROUP_MAX_MEMBERS;
-    const limited = new LimitedGroupService(h.models.Group, h.models.Users, h.chat, h.gateway, h.s3);
+    const limited = new LimitedGroupService(h.models.Group, h.models.Users, h.chat, h.gateway, h.blocks, h.photos);
     const [owner, a, b, c] = await h.users(4);
 
     await expect(limited.createGroup({ name: 'Too big', members: [a, b, c] }, owner)).rejects.toThrow(
@@ -149,14 +149,15 @@ describe('Groups (MongoDB integration)', () => {
     expect(await h.groups.updateGroup(groupId, { name: 'New', description: '' }, owner)).toMatchObject({ name: 'New', description: '' });
   });
 
-  it('signs group images when read instead of returning stored URLs', async () => {
+  // PhotoResponseInterceptor signs `groupIcon` on the way out.
+  it('returns the stored group image reference for signing, never the legacy key field', async () => {
     const [owner, member] = await h.users(2);
     const group = await h.groups.createGroup({ name: 'Pictured', members: [member] }, owner);
     await h.models.Group.updateOne({ _id: group._id }, { groupIconKey: 'groupIcon/abc.png' });
     const detail = await h.groups.getGroupMembers(String(group._id), owner);
-    expect(detail.groupIcon).toBe('https://signed.example/groupIcon/abc.png');
+    expect(detail.groupIcon).toBe('groupIcon/abc.png');
     expect(detail).not.toHaveProperty('groupIconKey');
     const [conversation] = await h.chat.getConversations(member);
-    expect((conversation as any).group.groupIcon).toBe('https://signed.example/groupIcon/abc.png');
+    expect((conversation as any).group.groupIcon).toBe('groupIcon/abc.png');
   });
 });

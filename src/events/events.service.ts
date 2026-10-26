@@ -1,4 +1,5 @@
 import { Injectable } from '@nestjs/common';
+import { preserveMutation } from '../reports/preservation';
 import { CreateEventDto } from './dto/create-event.dto';
 import { UpdateEventDto } from './dto/update-event.dto';
 import { Events, EventsDocument } from 'src/common/schemas/events.schema';
@@ -7,6 +8,7 @@ import { Model, SortOrder } from 'mongoose';
 import { InjectModel } from '@nestjs/mongoose';
 import { FilterEventDto } from './dto/filter-event.dto';
 import { UploadEventCoverDto } from './dto/upload-event-cover.dto';
+import { EventRequestStatus } from '../common/schemas/event-members.schema';
 
 @Injectable()
 export class EventsService {
@@ -71,7 +73,7 @@ export class EventsService {
 
     const eventsWithUsers = await Promise.all(
       events.map(async (event) => {
-        const users = await this.eventMembersModel.find({ event: event._id }).populate('user', 'displayname avatar');
+        const users = await this.eventMembersModel.find({ event: event._id, requestStatus: EventRequestStatus.ACCEPTED }).populate('user', 'displayname avatar');
         return Object.assign(event.toObject(), { users: users.map(user => user.user) });
       })
     );
@@ -106,7 +108,7 @@ export class EventsService {
   }
 
   async remove(_id: string) {
-    return await this.eventsModel.deleteOne({ _id });
+    return preserveMutation(this.eventsModel.db, [`Events:${_id}`], async () => await this.eventsModel.deleteOne({ _id }));
   }
 
   async addCover(_id: string, cover: UploadEventCoverDto) {

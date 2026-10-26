@@ -1,12 +1,16 @@
 import { Schema, SchemaFactory, Prop } from '@nestjs/mongoose';
 import { Document } from 'mongoose';
-import { EBlockedByEnum, ERole } from 'src/common/enums';
+import { EBlockedByEnum, ERole } from '../enums';
 import { genSalt, hash } from 'bcrypt';
-import { EJotFormStatus, EUserAccountStatus } from '../enums/users.enum';
+import { EUserAccountStatus } from '../enums/users.enum';
 
 export type UsersDocument = Users & Document;
 @Schema({ timestamps: true, collection: 'Users' })
 export class Users {
+  // Written exclusively by verified server entitlement processing (never a user DTO).
+  @Prop({ type: Date, default: null, select: false })
+  premiumUntil?: Date;
+
   @Prop({ required: true, unique: true })
   username: string;
 
@@ -23,8 +27,17 @@ export class Users {
   @Prop({ required: true })
   lastName: string;
 
+  // Legacy free-text value from web signup; never verified or unique.
   @Prop({ required: false })
   phoneNumber: string;
+
+  // Set only together with phoneVerifiedAt after a Twilio Verify approval.
+  // Unique via the operator-managed partial index phone_e164_unique.
+  @Prop({ type: String, required: false })
+  phoneE164?: string;
+
+  @Prop({ type: Date, required: false })
+  phoneVerifiedAt?: Date;
 
   @Prop({ required: false })
   gender: string;
@@ -69,10 +82,10 @@ export class Users {
   @Prop({ required: true, default: false })
   isBlocked: boolean;
 
-  @Prop({ required: true, enum: EBlockedByEnum, default: EBlockedByEnum.OPEN })
+  @Prop({ type: String, required: true, enum: EBlockedByEnum, default: EBlockedByEnum.OPEN })
   blockedBy: EBlockedByEnum;
 
-  @Prop({
+  @Prop({ type: String,
     required: true,
     enum: EUserAccountStatus,
     default: EUserAccountStatus.OPEN,
@@ -82,8 +95,16 @@ export class Users {
   @Prop({ required: false })
   blockedTime: Date;
 
+  @Prop({ required: false })
+  moderationSuspendedUntil: Date;
+
+  @Prop({ required: false })
+  deletionRequestedAt: Date;
+
   @Prop({
     required: true,
+    type: [String],
+    enum: Object.values(ERole),
   })
   roles: ERole[];
 

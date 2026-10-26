@@ -12,8 +12,8 @@ describe('PostsService', () => {
 
   beforeEach(async () => {
     const module: TestingModule = await Test.createTestingModule({
-      providers: [PostsService, ...postsModelProviders, { provide: S3BucketService, useValue: {} }],
-    }).compile();
+      providers: [PostsService],
+    }).useMocker(() => ({})).compile();
 
     service = module.get<PostsService>(PostsService);
   });

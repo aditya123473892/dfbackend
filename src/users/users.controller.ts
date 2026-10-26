@@ -10,12 +10,25 @@ import {
   UseInterceptors,
   UploadedFile,
   BadRequestException,
+  NotFoundException,
   Put,
   Delete,
 } from '@nestjs/common';
-import { SELF_EDITABLE_FIELDS, toUserResponse, UsersService } from './users.service';
-import { withSignedMedia } from 'src/posts/posts.service';
-import { ApiBearerAuth, ApiBody, ApiConsumes, ApiOperation, ApiParam, ApiQuery, ApiResponse, ApiTags } from '@nestjs/swagger';
+import { PhotosService } from '../photos/photos.service';
+import { SelfProfileDto } from './dtos/self-profile.dto';
+import { PhotoReferenceDto } from '../photos/photo.dto';
+import { ValidationPipe } from '@nestjs/common';
+import { toUserResponse, UsersService } from './users.service';
+import {
+  ApiBearerAuth,
+  ApiBody,
+  ApiConsumes,
+  ApiOperation,
+  ApiParam,
+  ApiQuery,
+  ApiResponse,
+  ApiTags,
+} from '@nestjs/swagger';
 import {
   badRequestRes,
   successRes,
@@ -42,9 +55,10 @@ import { MailService } from 'src/mail/mail.service';
 export class UsersController {
   constructor(
     private readonly usersService: UsersService,
+    private readonly photos: PhotosService,
     private readonly s3BucketService: S3BucketService,
     private readonly mailService: MailService,
-  ) { }
+  ) {}
 
   @Get('me')
   async findMe(@AuthUser() authUser: IAuthUser) {
@@ -92,12 +106,9 @@ export class UsersController {
       : badRequestRes('No unverified users found');
   }
 
-
   @Get('/book-mark')
   @ApiOperation({ summary: 'get Book-Mark User' })
-  async getUserBookMark(
-    @AuthUser() authUser: IAuthUser,
-  ) {
+  async getUserBookMark(@AuthUser() authUser: IAuthUser) {
     try {
       const bookMark = await this.usersService.getUserBookMark(authUser.id);
       return successRes({ bookMark }, 'Get Book Marks users successfully');
@@ -112,7 +123,6 @@ export class UsersController {
     return this.usersService.getRandomOnlineAdmin();
   }
 
-
   @Get('/chatlist')
   @ApiOperation({ summary: 'get user chat list' })
   async getUserChatList(@AuthUser() authUser: IAuthUser) {
@@ -120,25 +130,19 @@ export class UsersController {
     return successRes({ userChatlist });
   }
 
-  
   @UseGuards(RolesGuard)
   // @Roles(ERole.ADMIN)
   @Get(':id')
   @ApiParam({ name: 'id', required: true, description: 'User ID to fetch' })
-  @ApiResponse({ status: 200, description: 'Successfully fetched user details' })
-  @ApiResponse({ status: 400, description: 'User not found' })
-  async findOne(
-    @Param('id') userId: string,
-    @AuthUser() authUser: IAuthUser,
-  ) {
-    // Post visibility is decided for the authenticated caller. A `viewerId`
-    // query parameter from older clients is ignored: it could be spoofed.
-    const user = await this.usersService.findByIdWithUserPost(userId, authUser.id);
-    if (!user) return badRequestRes('User not found!');
-    const usersPost = await Promise.all(
-      (user.usersPost || []).map((post) => withSignedMedia(post, this.s3BucketService)),
-    );
-    return successRes({ user: { ...toUserResponse(user, authUser), usersPost } });
+  @ApiResponse({
+    status: 200,
+    description: 'Successfully fetched user details',
+  })
+  @ApiResponse({ status: 404, description: 'User not found or blocked' })
+  async findOne(@Param('id') userId: string, @AuthUser() actor: IAuthUser) {
+    const user = await this.usersService.findByIdWithUserPost(userId, actor.id);
+    if (!user) throw new NotFoundException('User not found!');
+    return successRes({ user: toUserResponse(user, actor) });
   }
 
   @UseGuards(RolesGuard)
@@ -154,19 +158,16 @@ export class UsersController {
     return successRes({ users: users.map((user) => toUserResponse(user, authUser)), count });
   }
 
-  /** Only profile fields; roles, credentials and account state cannot be self-assigned. */
+  /** Only SelfProfileDto fields; roles, credentials and account state cannot be self-assigned. */
   @Patch('/me')
   async update(
-    @Body() updateUserDto: UpdateUserDto,
+    @Body(new ValidationPipe({ whitelist: true, forbidNonWhitelisted: true }))
+    updateUserDto: SelfProfileDto,
     @AuthUser() user: IAuthUser,
   ) {
-    const changes = Object.fromEntries(
-      Object.entries(updateUserDto || {}).filter(([key]) => SELF_EDITABLE_FIELDS.includes(key)),
-    );
-    if (!Object.keys(changes).length) return badRequestRes('Nothing to update');
     const updatedUser = await this.usersService.updateOne(
       user.id,
-      changes as UpdateUserDto,
+      updateUserDto,
     );
 
     return updatedUser
@@ -192,7 +193,7 @@ export class UsersController {
     }
 
     // Create user
-    const user = await this.usersService.create(createUserDto);
+    const user = await this.usersService.create(createUserDto, authUser.id);
 
     if (!user) badRequestRes('Failed to register new user');
 
@@ -212,8 +213,9 @@ export class UsersController {
   async updateOne(
     @Param('id') _id: string,
     @Body() updateUserDto: UpdateUserDto,
+    @AuthUser() actor: IAuthUser,
   ) {
-    const updatedUser = await this.usersService.updateOne(_id, updateUserDto);
+    const updatedUser = await this.usersService.updateOne(_id, updateUserDto, actor.id);
 
     return updatedUser
       ? successRes({ user: updatedUser }, 'User updated!')
@@ -221,100 +223,42 @@ export class UsersController {
   }
 
   @Put('update-profile')
-  @ApiConsumes('multipart/form-data')
-  @ApiOperation({
-    summary: 'Update user profile details (with optional avatar)',
-    description: 'This endpoint allows users to update their profile information such as display name, first name, last name, bio, intrest, and upload an avatar image.',
-  })
-  @ApiBody({
-    schema: {
-      type: 'object',
-      properties: {
-        displayname: {
-          type: 'string',
-          description: 'User display name',
-          example: 'John Doe',
-        },
-        firstName: {
-          type: 'string',
-          description: 'User first name',
-          example: 'John',
-        },
-        lastName: {
-          type: 'string',
-          description: 'User last name',
-          example: 'Doe',
-        },
-        avatar: {
-          type: 'string',
-          format: 'binary',
-          description: 'Avatar image file (optional)',
-        },
-        bio: {
-          type: 'string',
-          description: 'User bio',
-          example: 'This is a short bio about the user.',
-        },
-        intrests: {
-          type: 'array',
-          items: { type: 'string' },
-          description: 'User interests',
-          example: ['cricket', 'football']
-        },
-        city: {
-          type: 'string',
-          description: 'City where the user resides',
-          example: 'New York',
-        },
-        state: {
-          type: 'string',
-          description: 'State where the user resides',
-          example: 'New York',
-        },
-        country: {
-          type: 'string',
-          description: 'Country where the user resides',
-          example: 'USA',
-        },
-      },
-    },
-  })
-  @UseInterceptors(FileInterceptor('avatar'))
   async updateProfile(
-    @Body() updateUserDto: UpdateUserProfileDto,
-    @UploadedFile() avatar: Express.Multer.File,
-    @AuthUser() user: IAuthUser,
+    @Body(new ValidationPipe({ whitelist: true, forbidNonWhitelisted: true }))
+    dto: SelfProfileDto,
+    @AuthUser() actor: IAuthUser,
   ) {
-    let avatarUrl: string | null = null;
-    let oldAvatarKey: string | null = null;
+    const user = await this.usersService.updateOneUserProfile(actor.id, dto);
+    return successRes({ user });
+  }
 
-    const currentUser = await this.usersService.findById(user.id);
-    if (currentUser && currentUser.avatar) {
-      oldAvatarKey = currentUser.avatar.split('?')[0];
-      oldAvatarKey = oldAvatarKey.split('/').pop();
-    }
+  @Put('me/avatar')
+  async setAvatar(
+    @Body(new ValidationPipe({ whitelist: true, forbidNonWhitelisted: true }))
+    dto: PhotoReferenceDto,
+    @AuthUser() actor: IAuthUser,
+  ) {
+    const ref = `avatar:${actor.id}`;
+    const current = await this.usersService.findById(actor.id);
+    const [photo] = await this.photos.bind(actor.id, [dto.uploadId], ref);
+    const updated = await this.photos.replaceImage(
+      'Users',
+      actor.id,
+      'avatar',
+      current?.avatar,
+      photo.filename,
+    );
+    if (current?.avatar && current.avatar !== photo.filename)
+      await this.photos.retire(ref, [current.avatar]);
+    if (current?.avatar && current.avatar !== photo.filename)
+      await this.photos.enqueue([current.avatar]);
+    return successRes({ user: updated });
+  }
 
-    if (avatar) {
-      try {
-        if (oldAvatarKey) {
-          await this.s3BucketService.deleteOne(`avatars/${oldAvatarKey}`, process.env.AWS_DEFAULT_S3_BUCKET);
-        }
-
-        const uploadResult = await this.s3BucketService.uploadFile(avatar, 'avatars');
-        avatarUrl = await this.s3BucketService.getSignedURL(uploadResult.Key, process.env.AWS_DEFAULT_S3_BUCKET);
-      } catch (err) {
-        throw new BadRequestException('Failed to upload avatar');
-      }
-    }
-
-    const updatedUser = await this.usersService.updateOneUserProfile(user.id, {
-      ...updateUserDto,
-      avatar: avatarUrl || currentUser.avatar,
-    });
-
-    return updatedUser
-      ? successRes({ user: updatedUser }, 'Profile updated successfully!')
-      : badRequestRes('Failed to update profile');
+  @Delete('me')
+  async deleteAccount(@AuthUser() actor: IAuthUser) {
+    await this.photos.requestAccountDeletion(actor.id);
+    return successRes({ deletionRequested: true });
   }
 
   @Post('/book-mark/:userId')
@@ -326,7 +270,7 @@ export class UsersController {
     try {
       const bookMark = await this.usersService.userBookMark(
         authUser.id,
-        userId
+        userId,
       );
       return successRes({ bookMark }, 'User Book Marks successfully');
     } catch (error) {
@@ -343,17 +287,21 @@ export class UsersController {
     try {
       const updatedBookMark = await this.usersService.updateBookMarkStatus(
         authUser.id,
-        userId
+        userId,
       );
-      return successRes({ updatedBookMark }, 'Bookmark status updated successfully');
+      return successRes(
+        { updatedBookMark },
+        'Bookmark status updated successfully',
+      );
     } catch (error) {
       return badRequestRes(error.message);
     }
   }
 
-
   @Post('send-request')
-  @ApiOperation({ summary: 'User submits a request to update profile with a remark' })
+  @ApiOperation({
+    summary: 'User submits a request to update profile with a remark',
+  })
   @ApiBody({
     schema: {
       type: 'object',
@@ -362,7 +310,7 @@ export class UsersController {
           type: 'string',
           description: 'Enter remark',
           example: 'I want to update my email and phone number',
-        }
+        },
       },
     },
   })
@@ -384,15 +332,24 @@ export class UsersController {
     @Body() createUserEditHistoryDto: CreateUserEditHistoryDto,
     @AuthUser() user: IAuthUser,
   ) {
-    const existingRequest = await this.usersService.getUserEditHistoryByUserIdAndStatus(user.id, false);
+    const existingRequest =
+      await this.usersService.getUserEditHistoryByUserIdAndStatus(
+        user.id,
+        false,
+      );
 
     if (existingRequest) {
-      return badRequestRes('You already have a pending request. You cannot submit another one.');
+      return badRequestRes(
+        'You already have a pending request. You cannot submit another one.',
+      );
     }
 
     const { remark } = createUserEditHistoryDto;
 
-    const history = await this.usersService.createUserEditHistory(user.id, remark);
+    const history = await this.usersService.createUserEditHistory(
+      user.id,
+      remark,
+    );
 
     return history
       ? successRes({ message: 'Request sent successfully!' })
@@ -405,7 +362,8 @@ export class UsersController {
   @ApiOperation({ summary: 'Admin approves the user profile change request' })
   @ApiParam({
     name: 'userId',
-    description: 'ID of the user whose profile change request is being approved',
+    description:
+      'ID of the user whose profile change request is being approved',
     type: String,
   })
   @ApiBody({
@@ -416,12 +374,18 @@ export class UsersController {
           type: 'boolean',
           description: 'Enter status',
           example: true,
-        }
+        },
       },
     },
   })
-  async approveRequest(@Param('userId') userId: string, @Body() approveUserRequestDto: ApproveUserRequestDto) {
-    const approvedUser = await this.usersService.approveUserEditRequest(userId, approveUserRequestDto);
+  async approveRequest(
+    @Param('userId') userId: string,
+    @Body() approveUserRequestDto: ApproveUserRequestDto,
+  ) {
+    const approvedUser = await this.usersService.approveUserEditRequest(
+      userId,
+      approveUserRequestDto,
+    );
 
     return approvedUser
       ? successRes({ user: approvedUser }, 'Request approved successfully')
@@ -459,7 +423,11 @@ export class UsersController {
 
   @Put('/follow/approve-follow/:followId')
   @ApiOperation({ summary: 'Approve or reject a follow request' })
-  @ApiParam({ name: 'followId', type: String, description: 'Follow request ID' })
+  @ApiParam({
+    name: 'followId',
+    type: String,
+    description: 'Follow request ID',
+  })
   @ApiBody({
     schema: {
       type: 'object',
@@ -475,11 +443,13 @@ export class UsersController {
   async approveFollowRequest(
     @Param('followId') followId: string,
     @Body() { status }: { status: FollowStatus },
+    @AuthUser() actor: IAuthUser,
   ) {
     try {
       const follow = await this.usersService.approveFollowRequest(
         followId,
         status,
+        actor.id,
       );
       return successRes({ follow }, 'Follow request processed successfully');
     } catch (error) {
@@ -495,21 +465,24 @@ export class UsersController {
     @AuthUser() authUser: IAuthUser,
   ) {
     try {
-      const unfollow = await this.usersService.unfollowUser(authUser.id, userId);
+      const unfollow = await this.usersService.unfollowUser(
+        authUser.id,
+        userId,
+      );
       return successRes({ unfollow }, 'Successfully unfollowed user');
     } catch (error) {
       return badRequestRes(error.message);
     }
   }
 
-
   @Get('/follow/follow-requests')
   @ApiOperation({ summary: 'Get all follow requests for the user' })
   async getFollowRequests(@AuthUser() authUser: IAuthUser) {
-    const followRequests = await this.usersService.getFollowRequests(authUser.id);
+    const followRequests = await this.usersService.getFollowRequests(
+      authUser.id,
+    );
     return successRes({ followRequests });
   }
-
 
   @Get('/follow/followers')
   @ApiOperation({ summary: 'Get all followers of the current user' })
@@ -533,7 +506,7 @@ export class UsersController {
       type: 'object',
       properties: {
         isEmailVerified: {
-          type: 'boolean'
+          type: 'boolean',
         },
       },
     },
@@ -564,25 +537,25 @@ export class UsersController {
       isEmailVerified,
     );
 
-
     const url = `${process.env.PUBLIC_SITE_DOMAIN}/signin`;
-    const status = isEmailVerified == true ? "accepted" : "not accepted";
+    const status = isEmailVerified == true ? 'accepted' : 'not accepted';
 
     //TODO: Send email here
     const sendEmail = await this.mailService.verifyAccountByAdmin(
       updatedUser.username,
       updatedUser.firstName,
       status,
-      url
+      url,
     );
 
     if (!sendEmail) return badRequestRes(`Unable to verification email`);
 
     return updatedUser
-      ? successRes({ message: 'Email verification status updated successfully' })
+      ? successRes({
+          message: 'Email verification status updated successfully',
+        })
       : badRequestRes('User not found or invalid status');
   }
-
 
   @UseGuards(RolesGuard)
   @Roles(ERole.ADMIN)
@@ -592,7 +565,7 @@ export class UsersController {
       type: 'object',
       properties: {
         isBlocked: {
-          type: 'boolean'
+          type: 'boolean',
         },
       },
     },
@@ -627,6 +600,4 @@ export class UsersController {
       ? successRes({ message: 'isBlocked status updated successfully' })
       : badRequestRes('User not found or invalid status');
   }
-
-
 }

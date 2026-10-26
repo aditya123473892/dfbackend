@@ -11,6 +11,7 @@ import {
   Put,
 } from '@nestjs/common';
 import { EventMembersService } from './event-members.service';
+import { StaffToolVisibilityGuard } from '../common/guards/staff-tool-visibility.guard';
 import { CreateEventMemberRequestDto } from './dto/create-event-member.dto';
 import { UpdateEventMemberDto } from './dto/update-event-member.dto';
 import { ApiBearerAuth, ApiTags, ApiOperation, ApiResponse, ApiParam, ApiBody } from '@nestjs/swagger';
@@ -69,6 +70,7 @@ export class EventMembersController {
     type: UpdateEventMemberDto,
   })
   @Put(':id/status')
+  @UseGuards(StaffToolVisibilityGuard)
   @ApiOperation({ summary: 'Accept or reject a join request for an event' })
   @ApiParam({ name: 'id', description: 'ID of the event member request' })
   @ApiResponse({
@@ -92,6 +94,7 @@ export class EventMembersController {
   
 
   @Delete(':id')
+  @UseGuards(StaffToolVisibilityGuard)
   @ApiOperation({ summary: 'Remove a member from an event' })
   @ApiParam({ name: 'id', description: 'ID of the event member to remove' })
   @ApiResponse({
@@ -110,6 +113,7 @@ export class EventMembersController {
   }
 
   @Get(':eventId/requests/pending')
+  @UseGuards(StaffToolVisibilityGuard)
   @ApiOperation({ summary: 'Get all pending requests for a particular event from the event creator' })
   @ApiParam({ name: 'eventId', description: 'ID of the event' })
   @ApiResponse({

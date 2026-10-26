@@ -31,6 +31,18 @@ export class ChatMessage {
   @Prop({ default: false })
   isRead: boolean;
 
+  @Prop({ default: false })
+  viewOnce: boolean;
+
+  @Prop({ type: Number })
+  viewDurationSeconds?: number;
+
+  @Prop({ type: Date })
+  expiresAt?: Date;
+
+  @Prop({ type: Date })
+  viewedAt?: Date;
+
   @Prop({ type: Date, default: Date.now })
   sentAt: Date;
 
@@ -38,18 +50,6 @@ export class ChatMessage {
   // the same key returns the stored message instead of creating a duplicate.
   @Prop({ required: false })
   clientId?: string;
-
-  // Disappearing messages: hidden from every query once this passes, then
-  // removed with their media by the expiry sweeper.
-  @Prop({ type: Date, required: false })
-  expiresAt?: Date;
-
-  // View-once media (direct chats): the recipient can obtain one access URL.
-  @Prop({ required: false })
-  viewOnce?: boolean;
-
-  @Prop({ type: Date, required: false })
-  viewedAt?: Date;
 }
 
 export const ChatMessageSchema = SchemaFactory.createForClass(ChatMessage);

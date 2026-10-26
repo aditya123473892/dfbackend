@@ -28,7 +28,7 @@ export class EventMembers {
   })
   event: EventsDocument | mongoose.Schema.Types.ObjectId;
 
-  @Prop({
+  @Prop({ type: String,
     enum: EventRequestStatus,
     required: true,
     default: EventRequestStatus.PENDING,

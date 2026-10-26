@@ -1,5 +1,12 @@
 import {
+  IsBoolean,
+  IsIn,
+  IsInt,
   IsDateString,
+  IsArray,
+  ArrayMaxSize,
+  ArrayUnique,
+  IsUUID,
   IsMongoId,
   IsOptional,
   IsString,
@@ -8,6 +15,32 @@ import {
 } from 'class-validator';
 
 export class CreateChatMessageDto {
+  @IsOptional()
+  @IsBoolean()
+  viewOnce?: boolean;
+
+  @IsOptional()
+  @IsInt()
+  @IsIn([3, 10, 30, 60])
+  viewDurationSeconds?: number;
+
+  @IsOptional()
+  @IsInt()
+  @IsIn([30, 300, 3600, 86400, 604800])
+  ttlSeconds?: number;
+
+  @IsOptional()
+  @IsArray()
+  @ArrayMaxSize(5)
+  @ArrayUnique()
+  @IsUUID('4', { each: true })
+  photoIds?: string[];
+
+  @IsOptional()
+  @IsString()
+  @Matches(/^[A-Za-z0-9_-]{8,64}$/)
+  clientId?: string;
+
   @IsOptional()
   @IsMongoId()
   receiver?: string;
@@ -24,21 +57,6 @@ export class CreateChatMessageDto {
   @IsOptional()
   @IsDateString()
   expiresAt?: string;
-
-  // Idempotency key generated once per message by the client and reused on
-  // retries.
-  @IsOptional()
-  @Matches(/^[A-Za-z0-9_-]{8,64}$/)
-  clientId?: string;
-
-  // Disappearing-message timer. Multipart bodies carry strings, so both forms
-  // are accepted here; ChatService validates against MESSAGE_TTL_SECONDS.
-  @IsOptional()
-  ttlSeconds?: number | string;
-
-  // View-once media: `true` or "true" (multipart). Validated by ChatService.
-  @IsOptional()
-  viewOnce?: boolean | string;
 }
 
 export class ChatMediaQueryDto {

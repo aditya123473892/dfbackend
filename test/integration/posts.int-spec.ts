@@ -52,21 +52,22 @@ describe('Posts, likes and comments (MongoDB integration)', () => {
     expect(state.likeArray).toBe(state.likeRows);
   });
 
+  // Posts the viewer may not see answer 403 (PostsService.commentPost).
   it('only allows likes and comments on posts the user can see', async () => {
     const [author, stranger, follower] = await h.users(3);
     const pending = await h.post(author, { status: 'pending' });
     const privatePost = await h.post(author, { visibility: 'private' });
     const friendsPost = await h.post(author, { visibility: 'friends' });
 
-    await expect(h.posts.likePost(String(pending._id), stranger)).rejects.toBeInstanceOf(NotFoundException);
-    await expect(h.posts.likePost(String(privatePost._id), stranger)).rejects.toBeInstanceOf(NotFoundException);
+    await expect(h.posts.likePost(String(pending._id), stranger)).rejects.toBeInstanceOf(ForbiddenException);
+    await expect(h.posts.likePost(String(privatePost._id), stranger)).rejects.toBeInstanceOf(ForbiddenException);
     await expect(
       h.posts.createComment({ post: String(privatePost._id), content: 'hi', user: stranger }),
-    ).rejects.toBeInstanceOf(NotFoundException);
+    ).rejects.toBeInstanceOf(ForbiddenException);
     // Authors can always interact with their own posts.
     await expect(h.posts.likePost(String(pending._id), author)).resolves.toMatchObject({ liked: true });
 
-    await expect(h.posts.likePost(String(friendsPost._id), follower)).rejects.toBeInstanceOf(NotFoundException);
+    await expect(h.posts.likePost(String(friendsPost._id), follower)).rejects.toBeInstanceOf(ForbiddenException);
     await h.models.Follow.create({ follower, following: author, status: 'accepted' });
     await expect(h.posts.likePost(String(friendsPost._id), follower)).resolves.toMatchObject({ liked: true });
 
@@ -84,7 +85,7 @@ describe('Posts, likes and comments (MongoDB integration)', () => {
     const [author, reader] = await h.users(2);
     const post = await h.post(author);
     const key = clientId();
-    const [first, second] = await Promise.all([
+    const [first, second]: any[] = await Promise.all([
       h.posts.createComment({ post: String(post._id), content: '  nice  ', user: reader, clientId: key }),
       h.posts.createComment({ post: String(post._id), content: '  nice  ', user: reader, clientId: key }),
     ]);
@@ -110,10 +111,10 @@ describe('Posts, likes and comments (MongoDB integration)', () => {
     for (let index = 0; index < 5; index++) {
       await h.posts.createComment({ post: String(post._id), content: `c${index}`, user: reader });
     }
-    const first = await h.posts.getComments(String(post._id), reader, { limit: 3 });
+    const first = await h.posts.listComments(String(post._id), reader, { limit: 3 });
     expect(first).toMatchObject({ hasMore: true, count: 5 });
     expect(first.comments.map((c: any) => c.content)).toEqual(['c4', 'c3', 'c2']);
-    const second = await h.posts.getComments(String(post._id), reader, {
+    const second = await h.posts.listComments(String(post._id), reader, {
       limit: 3,
       before: String(first.comments[2]._id),
     });
@@ -124,8 +125,8 @@ describe('Posts, likes and comments (MongoDB integration)', () => {
   it('lets the comment author or the post author delete a comment, nobody else', async () => {
     const [author, commenter, other] = await h.users(3);
     const post = await h.post(author);
-    const one = await h.posts.createComment({ post: String(post._id), content: 'one', user: commenter });
-    const two = await h.posts.createComment({ post: String(post._id), content: 'two', user: commenter });
+    const one: any = await h.posts.createComment({ post: String(post._id), content: 'one', user: commenter });
+    const two: any = await h.posts.createComment({ post: String(post._id), content: 'two', user: commenter });
 
     await expect(h.posts.deleteComment(String(post._id), String(one._id), other)).rejects.toBeInstanceOf(ForbiddenException);
     await expect(
@@ -138,24 +139,25 @@ describe('Posts, likes and comments (MongoDB integration)', () => {
     await expect(h.posts.deleteComment(String(post._id), String(two._id), author)).rejects.toBeInstanceOf(NotFoundException);
   });
 
-  it('deletes only the owner\'s post, with its likes, comments and media', async () => {
+  it('deletes only the owner\'s post, with its likes and bookmarks; comments stay as report evidence', async () => {
     const [author, other] = await h.users(2);
     const post = await h.post(author);
     await h.posts.likePost(String(post._id), other);
     await h.posts.createComment({ post: String(post._id), content: 'hi', user: other });
+    await h.posts.updatePostBookMarkStatus(other, String(post._id));
 
-    expect(await h.posts.deleteOwnPost(String(post._id), other)).toBeNull();
-    expect(h.s3.deleteOne).not.toHaveBeenCalled();
+    expect((await h.posts.removePrivate(String(post._id), other)).deletedCount).toBe(0);
     expect(await h.models.Posts.countDocuments()).toBe(1);
 
-    expect(await h.posts.deleteOwnPost(String(post._id), author)).not.toBeNull();
-    expect(h.s3.deleteOne).toHaveBeenCalledWith('posts/a.jpg', undefined);
+    expect((await h.posts.removePrivate(String(post._id), author)).deletedCount).toBe(1);
     expect(await h.models.Like.countDocuments()).toBe(0);
-    expect(await h.models.Comment.countDocuments()).toBe(0);
+    expect(await h.models.PostBookMark.countDocuments()).toBe(0);
+    expect(await h.models.Comment.countDocuments()).toBe(1);
     await expect(h.posts.likePost(String(post._id), other)).rejects.toBeInstanceOf(NotFoundException);
   });
 
-  it('returns the feed newest first with liked state, counts and freshly signed media', async () => {
+  // Media URLs are signed later, by PhotoResponseInterceptor.
+  it('returns the feed newest first with liked state and counts', async () => {
     const [author, viewer] = await h.users(2);
     const older = await h.post(author, { caption: 'older', createdAt: new Date('2026-01-01') });
     await h.post(author, { caption: 'newer', createdAt: new Date('2026-02-01') });
@@ -170,7 +172,7 @@ describe('Posts, likes and comments (MongoDB integration)', () => {
     expect(posts.map((p: any) => p.caption)).toEqual(['newer', 'older']);
     expect(posts[1]).toMatchObject({ likeCount: 1, likedByMe: true, followStatus: 'None' });
     expect(posts[0]).toMatchObject({ likeCount: 0, likedByMe: false });
-    expect(posts[0].media[0].url).toBe('https://signed.example/posts/a.jpg');
+    expect(posts[0].media[0].filename).toBe('posts/a.jpg');
   });
 
   it('never exposes credentials or tokens in user responses', async () => {

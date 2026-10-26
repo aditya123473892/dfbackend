@@ -1,6 +1,5 @@
 import {
   BadRequestException,
-  ConflictException,
   ForbiddenException,
   Injectable,
   NotFoundException,
@@ -16,16 +15,21 @@ import { Comment, CommentDocument } from 'src/common/schemas/comment.schema';
 import { Like, LikeDocument } from 'src/common/schemas/like.schema';
 import { CreateCommentDto, MAX_COMMENT_LENGTH } from './dto/create-comment.dto';
 import { UpdateCommentDto } from './dto/update-comment.dto';
-import { Follow, FollowStatus } from 'src/common/schemas/follow.schema';
-import { PostRequest, PostRequestDocument } from 'src/common/schemas/posts-request.schema';
-import { PostBookMark, PostBookMarkDocument } from 'src/common/schemas/posts-bookmark.schema';
+import { ListCommentsDto } from './dto/list-comments.dto';
+import { createHash } from 'crypto';
+import { pairBlocked } from '../user-blocks/block-context';
+import { visiblePostQuery } from '../user-blocks/visible-post';
+import { preserveMutation } from '../reports/preservation';
 import { EPostStatus, EPostVisibility } from 'src/common/enums/posts.enum';
-import { S3BucketService } from 'src/s3-bucket/s3-bucket.service';
-
-const MAX_PAGE_SIZE = 50;
-const SORTABLE_FIELDS = ['createdAt', 'updatedAt', '_id'];
-const AUTHOR_FIELDS = 'displayname avatar';
-const CLIENT_ID_PATTERN = /^[A-Za-z0-9_-]{8,64}$/;
+import { Follow, FollowStatus } from 'src/common/schemas/follow.schema';
+import {
+  PostRequest,
+  PostRequestDocument,
+} from 'src/common/schemas/posts-request.schema';
+import {
+  PostBookMark,
+  PostBookMarkDocument,
+} from 'src/common/schemas/posts-bookmark.schema';
 
 interface PostWithCounts extends PostsDocument {
   likeCount: number;
@@ -38,6 +42,9 @@ interface PostWithFollowStatus extends PostWithCounts {
 }
 
 const idOf = (value: any): string => String(value?._id ?? value ?? '');
+const MAX_PAGE_SIZE = 50;
+const SORTABLE_FIELDS = ['createdAt', 'updatedAt', '_id'];
+const AUTHOR_FIELDS = 'displayname avatar';
 
 @Injectable()
 export class PostsService {
@@ -46,9 +53,10 @@ export class PostsService {
     @InjectModel(Comment.name) private commentModel: Model<CommentDocument>,
     @InjectModel(Like.name) private likeModel: Model<LikeDocument>,
     @InjectModel(Follow.name) private followModel: Model<Follow>,
-    @InjectModel(PostRequest.name) private PostRequestModel: Model<PostRequestDocument>,
-    @InjectModel(PostBookMark.name) private PostBookMarkModel: Model<PostBookMarkDocument>,
-    private readonly s3BucketService?: S3BucketService,
+    @InjectModel(PostRequest.name)
+    private PostRequestModel: Model<PostRequestDocument>,
+    @InjectModel(PostBookMark.name)
+    private PostBookMarkModel: Model<PostBookMarkDocument>,
   ) {}
 
   async create(payload: CreatePostDto) {
@@ -79,6 +87,7 @@ export class PostsService {
     _id: string,
     payload: UpdatePostDto,
     user: IAuthUser,
+    expectedVersion?: number,
   ): Promise<PostsDocument | null> {
     const updateFields = {};
     Object.keys(payload).forEach((key) => {
@@ -89,8 +98,12 @@ export class PostsService {
 
     const updatedUser = await this.postsModel
       .findOneAndUpdate(
-        { _id, user: user.id },
-        { $set: updateFields },
+        {
+          _id,
+          user: user.id,
+          ...(expectedVersion === undefined ? {} : { __v: expectedVersion }),
+        },
+        { $set: updateFields, $inc: { __v: 1 } },
         { new: true },
       )
       .exec();
@@ -251,57 +264,6 @@ export class PostsService {
     }
   }
 
-  /**
-   * Whether the viewer may see (and therefore like or comment on) a post.
-   * Authors always see their own posts. Others only see approved posts:
-   * public ones, `friends` ones when they follow the author, and `private`
-   * ones while an accepted post request grants them access.
-   */
-  async canViewPost(post: any, viewerId: string): Promise<boolean> {
-    const ownerId = idOf(post.user);
-    if (ownerId === viewerId) return true;
-    if (post.status !== EPostStatus.APPROVED) return false;
-    if (post.visibility === EPostVisibility.PUBLIC) return true;
-    if (post.visibility === EPostVisibility.FRIENDS) {
-      return !!(await this.followModel.exists({
-        follower: viewerId,
-        following: ownerId,
-        status: FollowStatus.ACCEPTED,
-      }));
-    }
-    if (post.visibility === EPostVisibility.PRIVATE) {
-      const now = new Date();
-      return !!(await this.PostRequestModel.exists({
-        userId: ownerId,
-        requestedUserId: viewerId,
-        status: 'accepted',
-        startTime: { $lte: now },
-        endTime: { $gte: now },
-      }));
-    }
-    return false;
-  }
-
-  /** A post the viewer may see, populated like the feed; 404 otherwise. */
-  async findVisibleById(postId: string, viewerId: string) {
-    const post = await this.findPostForViewer(postId, viewerId);
-    await post.populate([
-      { path: 'user', select: AUTHOR_FIELDS },
-      { path: 'likes', select: 'user' },
-      {
-        path: 'comments',
-        select: 'content user createdAt',
-        populate: { path: 'user', select: AUTHOR_FIELDS },
-      },
-    ]);
-    return {
-      ...(await this.toClientPost(post)),
-      likeCount: post.likes.length,
-      commentCount: post.comments.length,
-      likedByMe: this.isLikedBy(post, viewerId),
-    };
-  }
-
   async findById(_id: string) {
     return Types.ObjectId.isValid(_id) ? await this.postsModel.findById(_id) : null;
   }
@@ -315,34 +277,33 @@ export class PostsService {
     return await this.postsModel.findOne(payload);
   }
 
+  async findVisiblePost(id: string, viewer: string) {
+    await this.commentPost(id, viewer);
+    return visiblePostQuery(
+      this.postsModel
+        .findOne({ _id: id })
+        .populate('user', 'displayname avatar'),
+    );
+  }
+
   async remove(_id: string) {
-    return await this.postsModel.deleteOne({ _id });
+    return preserveMutation(this.postsModel.db, [`Posts:${_id}`], () => this.postsModel.deleteOne({ _id }).exec());
   }
 
-  async removePrivate(_id: string, user: string) {
-    return await this.postsModel.deleteOne({ _id, user });
-  }
-
-  /**
-   * Deletes the caller's own post with its likes, comments, bookmarks and
-   * stored media. Returns null when the post does not exist or belongs to
-   * someone else, without touching anything.
-   */
-  async deleteOwnPost(postId: string, userId: string) {
-    if (!Types.ObjectId.isValid(postId)) return null;
-    const post = await this.postsModel.findOneAndDelete({ _id: postId, user: userId });
-    if (!post) return null;
-    await Promise.all([
-      this.likeModel.deleteMany({ post: post._id }),
-      this.commentModel.deleteMany({ post: post._id }),
-      this.PostBookMarkModel.deleteMany({ postId: post._id }),
-    ]);
-    for (const media of post.media || []) {
-      if (media.filename) {
-        await this.s3BucketService?.deleteOne(media.filename, process.env.AWS_DEFAULT_S3_BUCKET);
-      }
+  async removePrivate(_id: string, user: string, version?: number) {
+    const result = await preserveMutation(this.postsModel.db, [`Posts:${_id}`], async () => await this.postsModel.deleteOne({
+      _id,
+      user,
+      ...(version === undefined ? {} : { __v: version }),
+    }));
+    // Comments stay: they may be report evidence.
+    if (result.deletedCount) {
+      await Promise.all([
+        this.likeModel.deleteMany({ post: _id }),
+        this.PostBookMarkModel.deleteMany({ postId: _id }),
+      ]);
     }
-    return post;
+    return result;
   }
 
   async getPostBookMark(userId: string) {
@@ -368,6 +329,12 @@ export class PostsService {
         if (!bookmark.postId) return null;
 
         const post = bookmark.postId as any;
+        try {
+          await this.commentPost(String(post._id), userId);
+        } catch (error) {
+          if (error instanceof ForbiddenException || error instanceof NotFoundException) return null;
+          throw error;
+        }
         const postUserId = post.user._id.toString();
         const followStatus = await this.getFollowStatusForUser(userId, postUserId);
 
@@ -382,18 +349,14 @@ export class PostsService {
           },
           status: bookmark.status,
         };
-      })
+      }),
     );
 
     return enhancedBookMarks.filter(Boolean);
   }
 
   async updatePostBookMarkStatus(userId: string, postId: string) {
-
-    const post = await this.postsModel.findOne({ _id: postId });
-    if (!post) {
-      throw new Error('Post not found');
-    }
+    await this.commentPost(postId, userId);
 
     const existingBookmark = await this.PostBookMarkModel.findOne({
       userId,
@@ -401,7 +364,6 @@ export class PostsService {
     });
 
     if (!existingBookmark) {
-
       const newBookmark = new this.PostBookMarkModel({
         userId,
         postId,
@@ -429,122 +391,170 @@ export class PostsService {
   }
 
   async sendPostRequest(requestedUserId: string, userId: string) {
-
+    if (await pairBlocked(this.postsModel.db, userId, requestedUserId))
+      throw new Error('User not found!');
     const isFollowing = await this.followModel.findOne({
       follower: userId,
       following: requestedUserId,
-      status: "accepted"
+      status: 'accepted',
     });
 
     const isFollowedBy = await this.followModel.findOne({
       follower: requestedUserId,
       following: userId,
-      status: "accepted"
+      status: 'accepted',
     });
 
     if (!isFollowing || !isFollowedBy) {
-      throw new Error("Both users must be mutual followers with an accepted status to send a post request.");
+      throw new Error(
+        'Both users must be mutual followers with an accepted status to send a post request.',
+      );
     }
 
     const postRequest = new this.PostRequestModel({
       userId,
-      requestedUserId
+      requestedUserId,
     });
 
-    return await postRequest.save();
+    const saved = await postRequest.save();
+    if (await pairBlocked(this.postsModel.db, userId, requestedUserId)) {
+      await this.PostRequestModel.updateOne(
+        { _id: saved._id, status: 'pending' },
+        { $set: { status: 'rejected' } },
+      );
+      throw new Error('User not found!');
+    }
+    return saved;
   }
 
   async getPendingRequest(userId: string) {
-
     const request = await this.PostRequestModel.find({
       userId: userId,
-      status: "pending"
+      status: 'pending',
     }).populate('requestedUserId');
 
     if (!request || request.length === 0) {
-      throw new Error("No pending requests");
+      throw new Error('No pending requests');
     }
 
     return request;
-
   }
 
-  async approvePostEditRequest(userId: string, approverId: string, status: string): Promise<any> {
+  async approvePostEditRequest(
+    userId: string,
+    approverId: string,
+    status: string,
+  ): Promise<any> {
+    if (await pairBlocked(this.postsModel.db, userId, approverId)) return null;
     const startTime = new Date();
     const endTime = new Date(startTime.getTime() + 48 * 60 * 60 * 1000);
 
     const updatedRequest = await this.PostRequestModel.findOneAndUpdate(
-        { userId: approverId, requestedUserId: userId, status: 'pending' },
-        { status, startTime, endTime },
-        { new: true }
+      { userId: approverId, requestedUserId: userId, status: 'pending' },
+      { status, startTime, endTime },
+      { new: true },
     );
 
     return updatedRequest;
   }
 
-  async createComment(dto: CreateCommentDto & { user: string }) {
-    const content = this.validCommentContent(dto.content);
-    const clientId = this.validClientId(dto.clientId);
-    if (clientId) {
-      const existing = await this.commentModel.findOne({ user: dto.user, clientId });
-      if (existing) {
-        if (idOf(existing.post) !== String(dto.post)) {
-          throw new ConflictException('clientId was already used for another comment');
-        }
-        return this.toClientComment(existing);
-      }
+  private async commentPost(postId: string, userId: string) {
+    if (!Types.ObjectId.isValid(postId))
+      throw new BadRequestException('Invalid post ID');
+    const post = await this.postsModel.findById(postId);
+    if (!post) throw new NotFoundException('Post not found');
+    const owner = post.user.toString();
+    if (owner === userId) return post;
+    if (post.status === EPostStatus.APPROVED) {
+      if (post.visibility === EPostVisibility.PUBLIC) return post;
+      if (
+        post.visibility === EPostVisibility.FRIENDS &&
+        (await this.followModel.exists({
+          follower: userId,
+          following: owner,
+          status: FollowStatus.ACCEPTED,
+        }))
+      )
+        return post;
+      const now = new Date();
+      if (
+        post.visibility === EPostVisibility.PRIVATE &&
+        (await this.PostRequestModel.exists({
+          userId: owner,
+          requestedUserId: userId,
+          status: 'accepted',
+          startTime: { $lte: now },
+          endTime: { $gte: now },
+        }))
+      )
+        return post;
     }
-    await this.findPostForViewer(dto.post, dto.user);
-
-    let comment: CommentDocument;
-    try {
-      comment = await this.commentModel.create({ content, post: dto.post, user: dto.user, clientId });
-    } catch (error) {
-      if (error?.code === 11000 && clientId) {
-        const existing = await this.commentModel.findOne({ user: dto.user, clientId });
-        if (existing) return this.toClientComment(existing);
-      }
-      throw error;
-    }
-    // Atomic append; if the post was deleted in the meantime, undo the comment.
-    const attached = await this.postsModel.updateOne(
-      { _id: dto.post },
-      { $addToSet: { comments: comment._id } },
-    );
-    if (!attached.matchedCount) {
-      await this.commentModel.deleteOne({ _id: comment._id });
-      throw new NotFoundException('Post not found');
-    }
-    return this.toClientComment(comment);
+    throw new ForbiddenException('You cannot access comments on this post');
   }
 
-  /** Newest first. `before` is the id of the last comment of the previous page. */
-  async getComments(postId: string, viewerId: string, options: { limit?: number; before?: string } = {}) {
-    await this.findPostForViewer(postId, viewerId);
-    const limit = Math.min(MAX_PAGE_SIZE, Math.max(1, Math.floor(Number(options.limit)) || 20));
-    const filter: any = { post: new Types.ObjectId(postId) };
-    if (options.before) {
-      if (!Types.ObjectId.isValid(options.before)) throw new BadRequestException('Invalid cursor');
-      const cursor = await this.commentModel.findOne({ _id: options.before, post: postId }).select('createdAt');
-      if (!cursor) throw new BadRequestException('Invalid cursor');
+  async listComments(postId: string, userId: string, params: ListCommentsDto) {
+    await this.commentPost(postId, userId);
+    const filter: any = { post: postId };
+    if (params.before) {
+      const cursor = await this.commentModel
+        .findOne({ _id: params.before, post: postId })
+        .lean();
+      if (!cursor) throw new BadRequestException('Invalid comment cursor');
+      const createdAt = (cursor as any).createdAt;
       filter.$or = [
-        { createdAt: { $lt: (cursor as any).createdAt } },
-        { createdAt: (cursor as any).createdAt, _id: { $lt: cursor._id } },
+        { createdAt: { $lt: createdAt } },
+        { createdAt, _id: { $lt: cursor._id } },
       ];
     }
-    const [rows, count] = await Promise.all([
+    const limit = params.limit ?? 20;
+    const [comments, count] = await Promise.all([
       this.commentModel
         .find(filter)
         .sort({ createdAt: -1, _id: -1 })
         .limit(limit + 1)
-        .populate({ path: 'user', select: AUTHOR_FIELDS }),
+        .populate('user', 'displayname firstName lastName avatar')
+        .lean(),
       this.commentModel.countDocuments({ post: postId }),
     ]);
     return {
-      comments: await Promise.all(rows.slice(0, limit).map((comment) => this.toClientComment(comment))),
-      hasMore: rows.length > limit,
+      comments: comments.slice(0, limit),
+      hasMore: comments.length > limit,
       count,
     };
+  }
+
+  async createComment(
+    dto: CreateCommentDto & { user: string },
+  ): Promise<Comment> {
+    await this.commentPost(dto.post, dto.user);
+    const content = this.validCommentContent(dto.content);
+    // A deterministic ID makes concurrent retries safe without a database migration.
+    const id = dto.clientId
+      ? new Types.ObjectId(
+          createHash('sha256')
+            .update(`comment:${dto.user}:${dto.post}:${dto.clientId}`)
+            .digest('hex')
+            .slice(0, 24),
+        )
+      : new Types.ObjectId();
+    let comment: CommentDocument;
+    try {
+      comment = await this.commentModel.create({
+        _id: id,
+        post: dto.post,
+        user: dto.user,
+        content,
+      });
+    } catch (error) {
+      if (error.code !== 11000 || !dto.clientId) throw error;
+      comment = await this.commentModel.findById(id);
+      if (!comment) throw error;
+    }
+    await this.postsModel.updateOne(
+      { _id: dto.post },
+      { $addToSet: { comments: comment._id } },
+    );
+    return comment.populate('user', 'displayname firstName lastName avatar');
   }
 
   async updateComment(
@@ -566,26 +576,44 @@ export class PostsService {
     return this.toClientComment(comment);
   }
 
-  /** The comment's author or the post's author may delete a comment. */
-  async deleteComment(postId: string, commentId: string, userId: string) {
-    if (!Types.ObjectId.isValid(postId) || !Types.ObjectId.isValid(commentId)) {
-      throw new NotFoundException('Comment not found');
+  async deleteComment(
+    postId: string,
+    commentId: string,
+    userId: string,
+  ): Promise<{ message: string; commentCount: number }> {
+    const post = await this.commentPost(postId, userId);
+
+    if (!Types.ObjectId.isValid(commentId))
+      throw new BadRequestException('Invalid comment ID');
+
+    const commentObjectId = new Types.ObjectId(commentId);
+
+    const commentIndex = post.comments.findIndex(
+      (comment) => comment.toString() === commentObjectId.toString(),
+    );
+
+    if (commentIndex === -1) {
+      throw new NotFoundException('Comment not found in the post');
     }
-    const post = await this.postsModel.findById(postId).select('user');
-    if (!post) {
-      throw new NotFoundException('Post not found');
-    }
-    const comment = await this.commentModel.findOne({ _id: commentId, post: postId });
+
+    const comment = await this.commentModel.findById(commentId);
     if (!comment) {
       throw new NotFoundException('Comment not found');
     }
-    if (idOf(comment.user) !== userId && idOf(post.user) !== userId) {
+
+    if (comment.user.toString() !== userId && post.user.toString() !== userId) {
       throw new ForbiddenException('You are not the owner of this comment');
     }
-    await this.commentModel.deleteOne({ _id: comment._id });
-    await this.postsModel.updateOne({ _id: postId }, { $pull: { comments: comment._id } });
+
+    await this.postsModel.updateOne(
+      { _id: postId },
+      { $pull: { comments: commentObjectId } },
+    );
+
+    await this.commentModel.findByIdAndDelete(commentId);
+
     return {
-      deleted: true,
+      message: 'Comment deleted successfully',
       commentCount: await this.commentModel.countDocuments({ post: postId }),
     };
   }
@@ -596,7 +624,7 @@ export class PostsService {
    * and the post's `likes` array is rebuilt from it afterwards.
    */
   async likePost(postId: string, userId: string) {
-    const post = await this.findPostForViewer(postId, userId);
+    const post = await this.commentPost(postId, userId);
     try {
       await this.likeModel.create({ post: post._id, user: userId });
     } catch (error) {
@@ -607,18 +635,25 @@ export class PostsService {
   }
 
   async unlikePost(postId: string, userId: string) {
-    if (!Types.ObjectId.isValid(postId)) throw new NotFoundException('Post not found');
-    const post = await this.postsModel.findById(postId).select('_id');
-    if (!post) {
-      throw new NotFoundException('Post not found');
-    }
+    const post = await this.commentPost(postId, userId);
     await this.likeModel.deleteOne({ post: post._id, user: userId });
     await this.syncLikes(post._id);
     return this.likeState(post._id, false);
   }
 
+  /** Authoritative like state for the viewer, read from the Likes collection. */
+  async getLikeState(postId: string, userId: string) {
+    await this.commentPost(postId, userId);
+    const [likeCount, ownLike] = await Promise.all([
+      this.likeModel.countDocuments({ post: postId }),
+      this.likeModel.exists({ post: postId, user: userId }),
+    ]);
+    return { liked: !!ownLike, likeCount };
+  }
+
+  /** Plain copy of a post; PhotoResponseInterceptor signs its media. */
   async toClientPost(post: any) {
-    return withSignedMedia(post, this.s3BucketService);
+    return post?.toObject ? post.toObject() : { ...post };
   }
 
   /**
@@ -651,16 +686,6 @@ export class PostsService {
     return (post.likes || []).some((like: any) => idOf(like?.user) === userId);
   }
 
-  private async findPostForViewer(postId: string, viewerId: string) {
-    if (!Types.ObjectId.isValid(postId)) throw new NotFoundException('Post not found');
-    const post = await this.postsModel.findById(postId);
-    // A post the viewer may not see is reported as missing, not forbidden.
-    if (!post || !(await this.canViewPost(post, viewerId))) {
-      throw new NotFoundException('Post not found');
-    }
-    return post;
-  }
-
   private applyPaging(query: any, params: FilterPostDto) {
     const sortBy = SORTABLE_FIELDS.includes(params.sortBy) ? params.sortBy : 'createdAt';
     const order: SortOrder = String(params.order) === 'asc' || String(params.order) === '1' ? 1 : -1;
@@ -680,14 +705,6 @@ export class PostsService {
     return content;
   }
 
-  private validClientId(value: unknown) {
-    if (value === undefined || value === null || value === '') return undefined;
-    if (typeof value !== 'string' || !CLIENT_ID_PATTERN.test(value)) {
-      throw new BadRequestException('clientId must be 8-64 letters, digits, "-" or "_"');
-    }
-    return value;
-  }
-
   private async toClientComment(comment: any) {
     if (comment?.populate && !comment.user?.displayname) {
       await comment.populate({ path: 'user', select: AUTHOR_FIELDS });
@@ -696,19 +713,3 @@ export class PostsService {
   }
 }
 
-/**
- * A plain copy of the post whose media URLs are freshly signed from the stored
- * object keys. URLs signed at upload time expire, so they are never trusted.
- */
-export async function withSignedMedia(post: any, s3?: S3BucketService) {
-  const source = post?.toObject ? post.toObject() : { ...post };
-  const ttl = Math.min(86400, Math.max(300, Number(process.env.POST_MEDIA_URL_TTL_SECONDS || 3600)));
-  source.media = await Promise.all(
-    (source.media || []).map(async (media: any) => {
-      if (!media?.filename || !s3) return media;
-      const url = await s3.getSignedURL(media.filename, process.env.AWS_DEFAULT_S3_BUCKET, ttl);
-      return url ? { ...media, url } : media;
-    }),
-  );
-  return source;
-}

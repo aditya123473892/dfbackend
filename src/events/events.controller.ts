@@ -22,6 +22,9 @@ import {
   ApiTags,
 } from '@nestjs/swagger';
 import { badRequestRes, successRes } from 'src/common/interceptors';
+import { PhotosService } from '../photos/photos.service';
+import { NotFoundException, ValidationPipe } from '@nestjs/common';
+import { Types } from 'mongoose';
 import { EventsService } from './events.service';
 import { CreateEventDto } from './dto/create-event.dto';
 import { UpdateEventDto } from './dto/update-event.dto';
@@ -44,6 +47,7 @@ import { MailService } from 'src/mail/mail.service';
 export class EventsController {
   constructor(
     private readonly eventsService: EventsService,
+    private readonly photos: PhotosService,
     private readonly userService: UsersService,
     private readonly mailService: MailService,
     private readonly s3BucketService: S3BucketService,
@@ -99,51 +103,33 @@ export class EventsController {
     status: 400,
     description: 'Bad request, event creation failed',
   })
-  @UseInterceptors(FileInterceptor('cover'))
   async create(
-    @Body() createEventDto: CreateEventDto,
-    @UploadedFile() cover: Express.Multer.File,
-    @AuthUser() user: IAuthUser,
+    @Body(new ValidationPipe({ whitelist: true, forbidNonWhitelisted: true }))
+    dto: CreateEventDto,
+    @AuthUser() actor: IAuthUser,
   ) {
-    if (cover) {
-      const uploadedFile = await this.s3BucketService.uploadFile(
-        cover,
-        S3Folder.EVENTS,
-      );
-      if (!uploadedFile) return badRequestRes('Failed to upload cover image!');
-
-      const url = await this.s3BucketService.getSignedURL(
-        uploadedFile.Key,
-        process.env.AWS_DEFAULT_S3_BUCKET,
-      );
-      if (!url)
-        return badRequestRes('Failed to generate URL for the cover image');
-
-      createEventDto.cover = {
-        originalname: cover.originalname,
-        mimetype: cover.mimetype,
-        filename: uploadedFile.Key,
-        url: url,
-      };
+    const id = new Types.ObjectId().toString();
+    const payload: any = { _id: id, creator: actor.id };
+    for (const key of [
+      'name',
+      'description',
+      'theme',
+      'startAt',
+      'endAt',
+      'type',
+      'location',
+      'capacity',
+      'registrationDeadline',
+    ]) {
+      if (dto[key] !== undefined) payload[key] = dto[key];
     }
-
-    createEventDto.creator = user.id;
-
-    const event = await this.eventsService.create(createEventDto);
-    if (!event) return badRequestRes('Failed to create event');
-
-    const url = `${process.env.PUBLIC_SITE_DOMAIN}/events`;
-    const allUsers = await this.userService.findUsers();
-    if (!allUsers || allUsers.length === 0) return badRequestRes('No users found to notify');
-    const usersToNotify = allUsers.filter(user => user.roles.includes(ERole.USER));
-  
-    if (usersToNotify.length === 0) return badRequestRes('No users with the USER role found to notify');
-    for (const user of usersToNotify) {
-      const email = user.username;
-      await this.mailService.sendCreateEventMailForAllUser(email, user.firstName,url);
-    }
-
-    return successRes(event);
+    if (dto.coverUploadId)
+      [payload.cover] = await this.photos.bind(
+        actor.id,
+        [dto.coverUploadId],
+        `event:${id}`,
+      );
+    return successRes(await this.eventsService.create(payload));
   }
 
   @Get()
@@ -199,49 +185,43 @@ export class EventsController {
   })
   @ApiResponse({ status: 200, description: 'Event updated successfully' })
   @ApiResponse({ status: 400, description: 'Bad request, event update failed' })
-  @UseInterceptors(FileInterceptor('cover'))
   async update(
     @Param('id') id: string,
-    @Body() payload: UpdateEventDto,
-    @UploadedFile() cover: Express.Multer.File,
-    @AuthUser() user: IAuthUser,
+    @Body(new ValidationPipe({ whitelist: true, forbidNonWhitelisted: true }))
+    dto: UpdateEventDto,
+    @AuthUser() actor: IAuthUser,
   ) {
-    const event = await this.eventsService.findById(id);
-    if (!event) return badRequestRes('Event not found!');
-
-    if (cover) {
-      if (event.cover && event.cover.filename) {
-        await this.s3BucketService.deleteOne(
-          event.cover.filename,
-          process.env.AWS_DEFAULT_S3_BUCKET,
-        );
-      }
-
-      const uploadedFile = await this.s3BucketService.uploadFile(
-        cover,
-        'events',
-      );
-      if (!uploadedFile) return badRequestRes('Failed to upload cover image!');
-
-      const url = await this.s3BucketService.getSignedURL(
-        uploadedFile.Key,
-        process.env.AWS_DEFAULT_S3_BUCKET,
-      );
-      if (!url)
-        return badRequestRes('Failed to generate signed URL for cover image');
-
-      payload.cover = {
-        originalname: cover.originalname,
-        mimetype: cover.mimetype,
-        filename: uploadedFile.Key,
-        url: url,
-      };
+    const current = await this.eventsService.findById(id);
+    if (!current) throw new NotFoundException('Event not found');
+    const payload: any = {};
+    for (const key of [
+      'name',
+      'description',
+      'theme',
+      'startAt',
+      'endAt',
+      'type',
+      'location',
+      'capacity',
+      'registrationDeadline',
+    ]) {
+      if (dto[key] !== undefined) payload[key] = dto[key];
     }
-
-    const updatedEvent = await this.eventsService.update(id, payload);
-    if (!updatedEvent) return badRequestRes('Failed to update event!');
-
-    return successRes(updatedEvent);
+    if (dto.coverUploadId)
+      [payload.cover] = await this.photos.bind(
+        actor.id,
+        [dto.coverUploadId],
+        `event:${id}`,
+      );
+    const event = await this.eventsService.update(id, payload);
+    if (!event) throw new NotFoundException('Event not found');
+    if (payload.cover) {
+      await this.photos.retire(`event:${id}`, [current.cover?.filename]);
+      await this.photos.enqueue([
+        current.cover?.filename || current.cover?.url,
+      ]);
+    }
+    return successRes(event);
   }
 
   @Roles(ERole.ADMIN)
@@ -259,17 +239,9 @@ export class EventsController {
     const foundEvent = await this.eventsService.findById(id);
     if (!foundEvent) return badRequestRes('Event not found!');
 
-    if (foundEvent.cover && foundEvent.cover.filename) {
-      try {
-        await this.s3BucketService.deleteOne(
-          foundEvent.cover.filename,
-          process.env.AWS_DEFAULT_S3_BUCKET,
-        );
-      } catch (error) {
-        return badRequestRes('Failed to delete cover image from S3');
-      }
-    }
-
+    await this.photos.enqueue([
+      foundEvent.cover?.filename || foundEvent.cover?.url,
+    ]);
     const deleteEvent = await this.eventsService.remove(id);
     if (!deleteEvent.deletedCount)
       return badRequestRes('Failed to delete event!');

@@ -32,6 +32,11 @@ export class Notification {
   @Prop({ type: Object, required: false })
   metadata?: any; // Additional data (e.g., post ID, comment ID)
 
+  @Prop({ type: Boolean, default: false })
+  isRead: boolean;
+
 }
 
 export const NotificationSchema = SchemaFactory.createForClass(Notification);
+NotificationSchema.index({ receiver: 1, _id: -1 });
+NotificationSchema.index({ receiver: 1, isRead: 1 });

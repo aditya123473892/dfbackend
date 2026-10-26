@@ -1,6 +1,6 @@
 import { Schema, SchemaFactory, Prop } from '@nestjs/mongoose';
 import mongoose, { Document } from 'mongoose';
-import { EPostStatus, EPostVisibility } from '../enums/posts.enum';
+import { EContentVisibility, EPostStatus, EPostVisibility } from '../enums/posts.enum';
 import { UsersDocument } from './users.schema';
 import { Media } from './media.schema';
 import { Like } from './like.schema';
@@ -10,20 +10,31 @@ export type PostsDocument = Posts & Document;
 
 @Schema({ timestamps: true, collection: 'Posts' })
 export class Posts {
+  @Prop({ type: String, enum: EContentVisibility, default: EContentVisibility.NORMAL })
+  contentVisibility: EContentVisibility;
+
   @Prop({ required: false })
   caption: string;
 
   @Prop({ type: [Media], required: false })
   media: Media[];
 
-  @Prop({
+  /** Approved, moderated post videos bound through VideosService. */
+  @Prop({ type: [mongoose.Schema.Types.Mixed], required: false, default: undefined })
+  videos?: { videoId: string; storageKey: string; contentType: string; size?: number; status: string }[];
+
+  /** Staff moderation marker; hidden flags also archive the post. */
+  @Prop({ type: mongoose.Schema.Types.Mixed, required: false })
+  flag?: { reason: string; note?: string; hidden: boolean; by: string; at: Date; previousStatus?: string };
+
+  @Prop({ type: String,
     enum: EPostVisibility,
     required: true,
     default: EPostVisibility.PRIVATE,
   })
   visibility: EPostVisibility;
 
-  @Prop({
+  @Prop({ type: String,
     enum: EPostStatus,
     required: true,
     default: EPostStatus.PENDING,

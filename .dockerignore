@@ -17,16 +17,9 @@ coverage
 uploads
 local
 dump
+mongo_DF
 config.bat
 Dockerfile
 docker-compose.yml
 .dockerignore
 README.md
-
-.env
-.env.*
-!.env.example
-mongo_DF
-dump
-uploads
-*.bak

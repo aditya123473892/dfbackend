@@ -7,9 +7,9 @@ import {
   Param,
   Put,
   Delete,
-  UseInterceptors,
-  UploadedFile,
 } from '@nestjs/common';
+import { PhotoReferenceDto } from '../photos/photo.dto';
+import { ValidationPipe } from '@nestjs/common';
 import { GroupService } from './group.service';
 import { CreateGroupDto } from './dtos/create-group.dto';
 import { Group } from '../common/schemas/group-chat.schema';
@@ -20,7 +20,6 @@ import {
   ApiBody,
   ApiResponse,
   ApiOperation,
-  ApiConsumes,
 } from '@nestjs/swagger';
 import { ApiBearerAuth } from '@nestjs/swagger';
 import { successRes } from 'src/common/interceptors';
@@ -29,7 +28,6 @@ import { AuthUser } from 'src/common/decorators';
 import { IAuthUser } from 'src/common/interfaces';
 import { successGetRes } from 'src/common/interceptors/response.handlers';
 import { UpdateGroupDto } from './dtos/update-group.dto';
-import { FileInterceptor } from '@nestjs/platform-express';
 
 /**
  * Any authenticated user can create a group and becomes its owner. Membership
@@ -104,21 +102,14 @@ export class GroupController {
   }
 
   @Put(':groupId/upload-icon')
-  @ApiConsumes('multipart/form-data')
-  @ApiOperation({ summary: 'Upload a group image (owner only)' })
-  @ApiBody({
-    schema: {
-      type: 'object',
-      properties: { groupIcon: { type: 'string', format: 'binary' } },
-    },
-  })
-  @UseInterceptors(FileInterceptor('groupIcon', { limits: { fileSize: 5 * 1024 * 1024 } }))
+  @ApiOperation({ summary: 'Set the group image from an approved upload (owner only)' })
   async uploadGroupIcon(
     @Param('groupId') groupId: string,
-    @UploadedFile() groupIcon: Express.Multer.File,
-    @AuthUser() user: IAuthUser,
+    @Body(new ValidationPipe({ whitelist: true, forbidNonWhitelisted: true }))
+    dto: PhotoReferenceDto,
+    @AuthUser() actor: IAuthUser,
   ) {
-    return successRes(await this.groupService.uploadGroupIcon(groupId, groupIcon, user.id));
+    return successRes(await this.groupService.uploadGroupIcon(groupId, dto.uploadId, actor.id));
   }
 
   @Get(':groupId/members')

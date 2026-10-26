@@ -12,16 +12,28 @@ import {
   UseGuards,
   Query,
   Put,
+} from '@nestjs/common';
+import { PhotosService } from '../photos/photos.service';
+import { VideosService } from '../photos/videos.service';
+import { PhotoPostDto, EditPhotoPostDto } from './dto/photo-post.dto';
+import {
   BadRequestException,
   NotFoundException,
-  UnsupportedMediaTypeException,
+  ValidationPipe,
 } from '@nestjs/common';
-import { hasValidMediaSignature } from 'src/chats/chats.service';
-import { successGetRes } from 'src/common/interceptors/response.handlers';
+import { createHash } from 'crypto';
 import { PostsService } from './posts.service';
 import { CreatePostDto } from './dto/create-post.dto';
 import { UpdatePostDto } from './dto/update-post.dto';
-import { ApiBearerAuth, ApiBody, ApiConsumes, ApiOperation, ApiParam, ApiResponse, ApiTags } from '@nestjs/swagger';
+import {
+  ApiBearerAuth,
+  ApiBody,
+  ApiConsumes,
+  ApiOperation,
+  ApiParam,
+  ApiResponse,
+  ApiTags,
+} from '@nestjs/swagger';
 import { AuthUser, Roles } from 'src/common/decorators';
 import { DefaultFindParams, IAuthUser } from 'src/common/interfaces';
 import { FileInterceptor, FilesInterceptor } from '@nestjs/platform-express';
@@ -35,74 +47,26 @@ import { ERole } from 'src/common/enums';
 import { Media } from 'src/common/schemas/media.schema';
 import { MediaDto } from 'src/common/dtos/utils.dto/media.dto';
 import { CreateCommentDto } from './dto/create-comment.dto';
+import { ListCommentsDto } from './dto/list-comments.dto';
 import { UpdateCommentDto } from './dto/update-comment.dto';
 import { PostRequestDto } from './dto/post-request.dto';
 import { ApprovePostRequestDto } from './dto/approve-request.dto';
-
-const MAX_POST_FILES = 10;
-const POST_MEDIA_TYPES = [
-  'image/jpeg', 'image/png', 'image/gif', 'image/webp',
-  'video/mp4', 'video/webm', 'video/quicktime',
-];
-function maxPostFileSize() {
-  return Number(process.env.POST_MEDIA_MAX_FILE_SIZE || 50 * 1024 * 1024);
-}
 
 @ApiTags('Posts')
 @Controller('posts')
 export class PostsController {
   constructor(
     private readonly postsService: PostsService,
+    private readonly photos: PhotosService,
     private readonly s3BucketService: S3BucketService,
+    private readonly videos: VideosService,
   ) {}
-
-  // @Post('upload')
-  // @ApiConsumes('multipart/form-data')
-  // @ApiBody({
-  //   schema: {
-  //     type: 'object',
-  //     properties: {
-  //       file: {
-  //         type: 'string',
-  //         format: 'binary',
-  //       },
-  //     },
-  //   },
-  // })
-  // @UseInterceptors(FileInterceptor('file'))
-  // async uploadDocument(@UploadedFile() file, @Body() payload: CreatePostDto) {
-  //   console.log(file);
-
-  //   //Upload file to S3 bucket
-  //   const uploadedFile = await this.s3BucketService.uploadFile(
-  //     file,
-  //     S3Folder.POSTS,
-  //   );
-
-  //   if (!uploadedFile) {
-  //     return badRequestRes('Failed to upload file!');
-  //   }
-
-  //   // Generate secure url for document and save it to table
-  //   const url = await this.s3BucketService.getSignedURL(
-  //     uploadedFile.Key,
-  //     process.env.AWS_DEFAULT_S3_BUCKET,
-  //   );
-
-  //   // dto.filename = file.originalname;
-  //   // dto.mimeType = file.mimetype;
-  //   // dto.key = uploadedFile.Key;
-  //   // dto.doc = url;
-  //   return successRes({ uploadedFile, url });
-  // }
 
   @ApiBearerAuth()
   @UseGuards(JwtAuthGuard)
   @Get('/pending-request')
   @ApiOperation({ summary: 'get pending post request' })
-  async getPendingRequest(
-    @AuthUser() authUser: IAuthUser,
-  ) {
+  async getPendingRequest(@AuthUser() authUser: IAuthUser) {
     try {
       const PendingRequest = await this.postsService.getPendingRequest(
         authUser.id,
@@ -116,51 +80,8 @@ export class PostsController {
   @ApiBearerAuth()
   @UseGuards(JwtAuthGuard)
   @Patch('upload/:_id')
-  @ApiConsumes('multipart/form-data')
-  @ApiBody({
-    schema: {
-      type: 'object',
-      properties: {
-        media: {
-          type: 'array',
-          items: {
-            type: 'string',
-            format: 'binary',
-          },
-        },
-      },
-    },
-  })
-  @UseInterceptors(FilesInterceptor('media', MAX_POST_FILES, { limits: { fileSize: maxPostFileSize() } }))
-  async uploadMedia(
-    @Param('_id') _id: string,
-    @UploadedFiles() media: Express.Multer.File[] = [],
-    @AuthUser() user: IAuthUser,
-  ) {
-    const post = await this.postsService.findByIdPrivate(_id, user.id);
-
-    if (!post) return badRequestRes('Post not found!');
-
-    const tempMedia = await this.uploadPostMedia(media);
-    const uploadedFiles = tempMedia.map((item) => ({ uploadedFile: { key: item.filename }, url: item.url }));
-
-    if (!tempMedia.length) return badRequestRes('Unable to upload your media');
-
-    // Update media in post
-    const updatePost = await this.postsService.updateOnePrivate(
-      _id,
-      {
-        media: tempMedia,
-        status: tempMedia[0].mimetype.includes('image')
-          ? EPostStatus.APPROVED
-          : EPostStatus.PENDING,
-      },
-      user,
-    );
-
-    if (!updatePost) return badRequestRes('Failed to update post media');
-
-    return successRes({ updatePost, uploadedFiles, tempMedia });
+  async uploadMedia() {
+    throw new BadRequestException('Use confirmed photoIds with PUT /posts/:id');
   }
 
   @ApiBearerAuth()
@@ -182,14 +103,14 @@ export class PostsController {
   async approveRequest(
     @Param('userId') userId: string,
     @AuthUser() authUser: IAuthUser,
-    @Body() approvePostRequestDto: ApprovePostRequestDto
+    @Body() approvePostRequestDto: ApprovePostRequestDto,
   ) {
     const approvedPost = await this.postsService.approvePostEditRequest(
       userId,
       authUser.id,
-      approvePostRequestDto.status
+      approvePostRequestDto.status,
     );
-    
+
     return approvedPost
       ? successRes({ user: approvedPost }, 'Request approved successfully')
       : badRequestRes('Failed to approve request');
@@ -198,50 +119,42 @@ export class PostsController {
   @ApiBearerAuth()
   @UseGuards(JwtAuthGuard)
   @Post()
-  @ApiConsumes('multipart/form-data')
-  @ApiBody({
-    schema: {
-      type: 'object',
-      properties: {
-        caption: { type: 'string' },
-        location: { type: 'string' },
-        visibility: { type: 'string', enum: ['public', 'private', 'friends', 'custom'] },
-        // status: { type: 'string', enum: ['pending', 'approved','rejected', 'draft', 'archived'] },
-        media: {
-          type: 'array',
-          items: {
-            type: 'string',
-            format: 'binary',
-          },
-        },
-      },
-    },
-  })
-  @UseInterceptors(FilesInterceptor('media', MAX_POST_FILES, { limits: { fileSize: maxPostFileSize() } }))
   async create(
-    @Body() createPostDto: CreatePostDto,
-    @UploadedFiles() media: Express.Multer.File[] = [],
-    @AuthUser() user: IAuthUser,
+    @Body(new ValidationPipe({ whitelist: true, forbidNonWhitelisted: true }))
+    dto: PhotoPostDto,
+    @AuthUser() actor: IAuthUser,
   ) {
-    if (!media.length) throw new BadRequestException('Choose a photo or video to post');
-    const uploadedMedia = await this.uploadPostMedia(media);
-
-    // Status is decided by moderation, never by the author.
-    const { status, ...fields } = createPostDto;
-    const postData = {
-      ...fields,
-      caption: fields.caption?.trim(),
-      user: user.id,
-      media: uploadedMedia,
-    } as CreatePostDto;
-
-    const post = await this.postsService.create(postData);
-
-    if (!post) return badRequestRes('Failed to create post!');
-
-    return successRes(await this.postsService.toClientPost(post));
+    const id = createHash('sha256')
+      .update(`post:${actor.id}:${dto.clientId}`)
+      .digest('hex')
+      .slice(0, 24);
+    const existing = await this.postsService.findByIdPrivate(id, actor.id);
+    if (existing) return successRes(existing);
+    if (!dto.photoIds?.length && !dto.videoIds?.length)
+      throw new BadRequestException('Choose at least one photo or video');
+    const media = await this.photos.bind(actor.id, dto.photoIds || [], `post:${id}`);
+    const videos = await this.videos.bind(actor.id, dto.videoIds || [], `post:${id}`);
+    try {
+      const post = await this.postsService.create({
+        _id: id,
+        caption: dto.caption,
+        location: dto.location,
+        visibility: dto.visibility || EPostVisibility.PRIVATE,
+        contentVisibility: dto.contentVisibility || 'normal',
+        user: actor.id,
+        media,
+        ...(videos.length ? { videos } : {}),
+        status: EPostStatus.APPROVED,
+      } as any);
+      return successRes(post);
+    } catch (error) {
+      if (error.code === 11000)
+        return successRes(
+          await this.postsService.findByIdPrivate(id, actor.id),
+        );
+      throw error;
+    }
   }
-
 
   @ApiBearerAuth()
   @UseGuards(JwtAuthGuard)
@@ -256,12 +169,14 @@ export class PostsController {
     }
   }
 
-
   // Use for feeds page
   @ApiBearerAuth()
   @UseGuards(JwtAuthGuard)
   @Get('/public/feeds')
-  async findPublicFeeds(@Query() params: FilterPostDto, @AuthUser() user: IAuthUser) {
+  async findPublicFeeds(
+    @Query() params: FilterPostDto,
+    @AuthUser() user: IAuthUser,
+  ) {
     const options: FilterPostDto = {
       ...DefaultFindParams,
       ...params,
@@ -269,8 +184,10 @@ export class PostsController {
       status: EPostStatus.APPROVED,
     };
 
-    const { posts, count } = await this.postsService.findAllPublic(options, user.id);
-
+    const { posts, count } = await this.postsService.findAllPublic(
+      options,
+      user.id,
+    );
 
     return successRes({ posts, count });
   }
@@ -298,95 +215,90 @@ export class PostsController {
   @UseGuards(JwtAuthGuard)
   @Get(':id')
   async findOne(@Param('id') _id: string, @AuthUser() user: IAuthUser) {
-    return successGetRes(await this.postsService.findVisibleById(_id, user.id));
-  }
+    let post;
+    try {
+      post = await this.postsService.findVisiblePost(_id, user.id);
+    } catch (error) {
+      if (error.getStatus?.() === 404) return badRequestRes('Post not found!');
+      throw error;
+    }
 
-  @ApiBearerAuth()
-  @UseGuards(JwtAuthGuard)
-  @Get(':postId/comments')
-  @ApiOperation({ summary: 'Comments of a visible post, newest first' })
-  async getComments(
-    @Param('postId') postId: string,
-    @Query('limit') limit: string,
-    @Query('before') before: string,
-    @AuthUser() user: IAuthUser,
-  ) {
-    return successGetRes(
-      await this.postsService.getComments(postId, user.id, { limit: Number(limit), before }),
-    );
+    if (!post) return badRequestRes('Post not found!');
+
+    return successRes(post);
   }
 
   @ApiBearerAuth()
   @UseGuards(JwtAuthGuard)
   @Put(':id')
-  @ApiConsumes('multipart/form-data')
-  @ApiBody({
-    schema: {
-      type: 'object',
-      properties: {
-        caption: { type: 'string' },
-        location: { type: 'string' },
-        visibility: { type: 'string', enum: ['public', 'private', 'friends', 'custom'] },
-        status: { type: 'string', enum: ['pending', 'approved', 'rejected', 'draft', 'archived'] },
-        media: {
-          type: 'array',
-          items: {
-            type: 'string',
-            format: 'binary',
-          },
-        },
-      },
-    },
-  })
-  @UseInterceptors(FilesInterceptor('media', MAX_POST_FILES, { limits: { fileSize: maxPostFileSize() } }))
   async update(
-    @Param('id') _id: string,
-    @Body() payload: UpdatePostDto,
-    @UploadedFiles() media: Express.Multer.File[] = [],
-    @AuthUser() user: IAuthUser,
+    @Param('id') id: string,
+    @Body(new ValidationPipe({ whitelist: true, forbidNonWhitelisted: true }))
+    dto: EditPhotoPostDto,
+    @AuthUser() actor: IAuthUser,
   ) {
-    const post = await this.postsService.findByIdPrivate(_id, user.id);
-
-    if (!post) return badRequestRes('Post not found!');
-
-    // New files replace the old ones; without files the existing media stays
-    // (and stays in storage).
-    const uploadedMedia = media.length ? await this.uploadPostMedia(media) : [];
-
-    // Status is decided by moderation, never by the author.
-    const { status, user: _ignored, ...fields } = payload;
-    const updatedPostData = {
-      ...fields,
-      ...(fields.caption !== undefined ? { caption: fields.caption.trim() } : {}),
-      media: uploadedMedia.length > 0 ? uploadedMedia : post.media,
-    };
-
-    const updatePost = await this.postsService.updateOnePrivate(_id, updatedPostData, user);
-
-    if (!updatePost) return badRequestRes('Failed to update post');
-
-    if (uploadedMedia.length) {
-      for (const existing of post.media || []) {
-        if (existing.filename) {
-          await this.s3BucketService.deleteOne(existing.filename, process.env.AWS_DEFAULT_S3_BUCKET);
-        }
-      }
+    const post = await this.postsService.findByIdPrivate(id, actor.id);
+    if (!post) throw new NotFoundException('Post not found');
+    const media = dto.photoIds
+      ? await this.photos.bind(actor.id, dto.photoIds, `post:${id}`)
+      : post.media;
+    const videos = dto.videoIds
+      ? await this.videos.bind(actor.id, dto.videoIds, `post:${id}`)
+      : undefined;
+    if (!media?.length && !(videos ?? (post as any).videos ?? []).length)
+      throw new BadRequestException('A post needs at least one photo or video');
+    const patch: any = {};
+    if (dto.photoIds) patch.media = media;
+    if (videos) patch.videos = videos;
+    for (const field of ['caption', 'location', 'visibility', 'contentVisibility'])
+      if (dto[field] !== undefined) patch[field] = dto[field];
+    if (dto.photoIds || dto.videoIds) patch.status = EPostStatus.APPROVED;
+    const updated = await this.postsService.updateOnePrivate(
+      id,
+      patch,
+      actor,
+      (post as any).__v ?? 0,
+    );
+    if (!updated) throw new NotFoundException('Post not found');
+    if (dto.photoIds) {
+      const keep = media.map((item) => item.filename);
+      await this.photos.retire(
+        `post:${id}`,
+        post.media
+          .filter((item) => !keep.includes(item.filename))
+          .map((item) => item.filename),
+      );
+      await this.photos.enqueue(
+        post.media
+          .filter((item) => !keep.includes(item.filename))
+          .map((item) => item.filename || item.url),
+      );
     }
-
-    return successRes(await this.postsService.toClientPost(updatePost));
+    if (videos) await this.videos.release(actor.id, `post:${id}`, dto.videoIds);
+    return successRes(await this.postsService.findVisiblePost(id, actor.id));
   }
 
   @ApiBearerAuth()
   @UseGuards(JwtAuthGuard)
   @Delete(':id')
-  async remove(@Param('id') _id: string, @AuthUser() user: IAuthUser) {
-    // Ownership is checked before anything (including stored media) is removed.
-    const deleted = await this.postsService.deleteOwnPost(_id, user.id);
-    if (!deleted) throw new NotFoundException('Post not found');
-
-    return successRes({ deleted: true }, 'Post deleted!');
+  async remove(@Param('id') id: string, @AuthUser() actor: IAuthUser) {
+    const post = await this.postsService.findByIdPrivate(id, actor.id);
+    if (!post) throw new NotFoundException('Post not found');
+    // Persist a retryable deletion before removing the authorized DB row.
+    await this.photos.enqueue(
+      post.media.map((item) => item.filename || item.url),
+    );
+    const result = await this.postsService.removePrivate(
+      id,
+      actor.id,
+      (post as any).__v ?? 0,
+    );
+    if (!result.deletedCount)
+      throw new NotFoundException('Post changed; refresh before deleting');
+    await this.photos.release(actor.id, `post:${id}`);
+    await this.videos.release(actor.id, `post:${id}`);
+    return successRes({ deleted: true });
   }
-
 
   // @ApiBearerAuth()
   // @UseGuards(JwtAuthGuard)
@@ -407,7 +319,6 @@ export class PostsController {
   //   }
   // }
 
-
   @ApiBearerAuth()
   @UseGuards(JwtAuthGuard)
   @Put('/book-mark/status/:postId')
@@ -419,14 +330,16 @@ export class PostsController {
     try {
       const updatedBookMark = await this.postsService.updatePostBookMarkStatus(
         authUser.id,
-        postId
+        postId,
       );
-      return successRes({ updatedBookMark }, 'Post bookmark status updated successfully');
+      return successRes(
+        { updatedBookMark },
+        'Post bookmark status updated successfully',
+      );
     } catch (error) {
       return badRequestRes(error.message);
     }
   }
-
 
   @ApiBearerAuth()
   @UseGuards(JwtAuthGuard)
@@ -459,6 +372,20 @@ export class PostsController {
     }
   }
 
+  @ApiBearerAuth()
+  @UseGuards(JwtAuthGuard)
+  @Get(':postId/comments')
+  @ApiOperation({ summary: 'List comments on a visible post, newest first' })
+  async listComments(
+    @Param('postId') postId: string,
+    @Query(new ValidationPipe({ transform: true, whitelist: true }))
+    params: ListCommentsDto,
+    @AuthUser() user: IAuthUser,
+  ) {
+    return successRes(
+      await this.postsService.listComments(postId, user.id, params),
+    );
+  }
 
   @ApiBearerAuth()
   @UseGuards(JwtAuthGuard)
@@ -475,7 +402,8 @@ export class PostsController {
     },
   })
   async createComment(
-    @Body() createCommentDto: CreateCommentDto,
+    @Body(new ValidationPipe({ transform: true, whitelist: true }))
+    createCommentDto: CreateCommentDto,
     @AuthUser() user: IAuthUser,
   ) {
     const commentData = {
@@ -517,23 +445,33 @@ export class PostsController {
     @Param('commentId') commentId: string,
     @AuthUser() user: IAuthUser,
   ) {
-    const result = await this.postsService.deleteComment(postId, commentId, user.id);
-    return successRes({ message: 'Comment deleted successfully', ...result });
+    const result = await this.postsService.deleteComment(
+      postId,
+      commentId,
+      user.id,
+    );
+
+    if (result) {
+      return successRes(result);
+    } else {
+      return badRequestRes('Failed to delete the comment');
+    }
   }
 
   @ApiBearerAuth()
   @UseGuards(JwtAuthGuard)
   @Post(':postId/like')
   @ApiOperation({ summary: 'Like a post' })
-  @ApiResponse({ status: 200, description: 'Idempotent; returns { liked, likeCount }.' })
-  async likePost(
-    @Param('postId') postId: string,
-    @AuthUser() user: IAuthUser,
-  ) {
-    const state = await this.postsService.likePost(postId, user.id);
-    return successRes(state, 'Post liked successfully.');
+  @ApiResponse({ status: 200, description: 'Post liked successfully.' })
+  @ApiResponse({
+    status: 400,
+    description: 'You have already liked this post.',
+  })
+  async likePost(@Param('postId') postId: string, @AuthUser() user: IAuthUser) {
+    await this.postsService.likePost(postId, user.id);
+    return successRes(await this.postsService.getLikeState(postId, user.id), 'Post liked successfully.');
   }
-  
+
   @ApiBearerAuth()
   @UseGuards(JwtAuthGuard)
   @Delete(':postId/unlike')
@@ -543,37 +481,8 @@ export class PostsController {
     @Param('postId') postId: string,
     @AuthUser() user: IAuthUser,
   ) {
-    const state = await this.postsService.unlikePost(postId, user.id);
-    return successRes(state, 'Post unliked successfully.');
-  }
-
-  /** Validates, then uploads post media; removes already-uploaded files on failure. */
-  private async uploadPostMedia(files: Express.Multer.File[]): Promise<MediaDto[]> {
-    for (const file of files) {
-      const type = file.mimetype?.toLowerCase();
-      if (!POST_MEDIA_TYPES.includes(type) || !hasValidMediaSignature(type, file.buffer)) {
-        throw new UnsupportedMediaTypeException('Posts accept JPEG, PNG, GIF or WebP images and MP4, WebM or MOV videos');
-      }
-    }
-    const uploaded: MediaDto[] = [];
-    for (const file of files) {
-      const result: any = await this.s3BucketService.uploadFile(file, S3Folder.POSTS);
-      if (!result) {
-        for (const item of uploaded) {
-          await this.s3BucketService.deleteOne(item.filename, process.env.AWS_DEFAULT_S3_BUCKET);
-        }
-        throw new BadRequestException('Media upload is unavailable. Please try again later.');
-      }
-      const key = result.Key || result.key;
-      uploaded.push({
-        // Stored for older readers; responses re-sign media from `filename`.
-        url: (await this.s3BucketService.getSignedURL(key, process.env.AWS_DEFAULT_S3_BUCKET)) || '',
-        filename: key,
-        mimetype: file.mimetype,
-        originalname: file.originalname,
-      });
-    }
-    return uploaded;
+    await this.postsService.unlikePost(postId, user.id);
+    return successRes(await this.postsService.getLikeState(postId, user.id), 'Post unliked successfully.');
   }
 }
 

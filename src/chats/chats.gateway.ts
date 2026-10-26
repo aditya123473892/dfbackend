@@ -13,6 +13,8 @@ import { Server, Socket } from 'socket.io';
 import { ObjectId } from 'mongodb';
 import { ChatService } from './chats.service';
 import { ERole } from 'src/common/enums';
+import { PhotosService } from '../photos/photos.service';
+import { BlockService } from '../user-blocks/block.service';
 
 function socketCorsOrigin(
   origin: string,
@@ -35,7 +37,9 @@ function socketCorsOrigin(
 @WebSocketGateway({
   cors: { origin: socketCorsOrigin, credentials: true },
 })
-export class ChatGateway implements OnGatewayInit, OnGatewayConnection, OnGatewayDisconnect {
+export class ChatGateway
+  implements OnGatewayInit, OnGatewayConnection, OnGatewayDisconnect
+{
   @WebSocketServer()
   server: Server;
 
@@ -45,9 +49,32 @@ export class ChatGateway implements OnGatewayInit, OnGatewayConnection, OnGatewa
   constructor(
     private readonly chatService: ChatService,
     private readonly jwtService: JwtService,
+    private readonly photos: PhotosService,
+    private readonly blocks: BlockService,
   ) {}
 
   afterInit(server: Server) {
+    this.blocks.suspensionChanges$?.subscribe((owner) => server.in(`user:${owner}`).disconnectSockets(true));
+    this.blocks.restrictedChanges$?.subscribe(() => {
+      // Every process watches MongoDB. Local broadcast avoids duplicate adapter
+      // fan-out and contains no case, content, target or reporter identifier.
+      server.local.emit('visibilityChanged');
+    });
+    this.blocks.changes$.subscribe(({ a, b }) => {
+      for (const id of [a, b]) {
+        server.to(`user:${id}`).emit('visibilityChanged');
+        server.in(`user:${id}`).disconnectSockets(true);
+      }
+    });
+    this.blocks.groupRemoval$.subscribe(({ groupId, members }) => {
+      for (const id of members) {
+        server.in(`user:${id}`).socketsLeave(`group:${groupId}`);
+        server.to(`user:${id}`).emit('groupRemoved', { groupId });
+      }
+    });
+    this.photos.accountDeletion$.subscribe((owner) =>
+      server.in(`user:${owner}`).disconnectSockets(true),
+    );
     server.use(async (client, next) => {
       try {
         await this.authenticateClient(client);
@@ -62,6 +89,15 @@ export class ChatGateway implements OnGatewayInit, OnGatewayConnection, OnGatewa
     try {
       if (!client.data.userId) await this.authenticateClient(client);
       const userId = client.data.userId;
+      client.use(async (_packet, next) => {
+        try {
+          await this.authenticateClient(client);
+          next();
+        } catch {
+          client.emit('authError', { message: 'Account is unavailable' });
+          client.disconnect(true);
+        }
+      });
       const user = await this.chatService.getUserById(userId);
       client.join(`user:${userId}`);
       // Subscribe to every group up front so group messages arrive even before
@@ -75,7 +111,7 @@ export class ChatGateway implements OnGatewayInit, OnGatewayConnection, OnGatewa
 
       if (user.roles?.includes(ERole.ADMIN)) {
         this.onlineAdmins.add(userId);
-        this.server.emit('adminOnline', { adminId: userId });
+        await this.broadcastPresence(userId, 'adminOnline');
       }
     } catch (_error) {
       client.emit('authError', { message: 'Unauthorized socket connection' });
@@ -92,8 +128,11 @@ export class ChatGateway implements OnGatewayInit, OnGatewayConnection, OnGatewa
     this.userSockets.delete(userId);
     await this.chatService.updateUserStatus(userId, false);
     const user = await this.chatService.getUserById(userId);
-    if (user?.roles?.includes(ERole.ADMIN) && this.onlineAdmins.delete(userId)) {
-      this.server.emit('adminOffline', { adminId: userId });
+    if (
+      user?.roles?.includes(ERole.ADMIN) &&
+      this.onlineAdmins.delete(userId)
+    ) {
+      await this.broadcastPresence(userId, 'adminOffline');
     }
   }
 
@@ -112,6 +151,12 @@ export class ChatGateway implements OnGatewayInit, OnGatewayConnection, OnGatewa
     try {
       await this.chatService.assertGroupMember(client.data.userId, groupId);
       await client.join(`group:${groupId}`);
+      try {
+        await this.chatService.assertGroupMember(client.data.userId, groupId);
+      } catch (error) {
+        await client.leave(`group:${groupId}`);
+        throw error;
+      }
       return { groupId };
     } catch (error) {
       this.emitError(client, error);
@@ -124,8 +169,14 @@ export class ChatGateway implements OnGatewayInit, OnGatewayConnection, OnGatewa
     @ConnectedSocket() client: Socket,
   ) {
     try {
-      if (data.media?.length) throw new Error('Attachments must use the authenticated upload endpoint');
-      await this.chatService.assertCanSendDirect(client.data.userId, data.receiver);
+      if (data.media?.length)
+        throw new Error(
+          'Attachments must use the authenticated upload endpoint',
+        );
+      await this.chatService.assertCanSendDirect(
+        client.data.userId,
+        data.receiver,
+      );
       const saved = await this.chatService.saveTextMessage({
         sender: client.data.userId,
         receiver: data.receiver,
@@ -134,8 +185,15 @@ export class ChatGateway implements OnGatewayInit, OnGatewayConnection, OnGatewa
         clientId: data.clientId,
         ttlSeconds: data.ttlSeconds,
       });
-      this.broadcastSavedMessage(saved);
-      const unreadData = await this.chatService.getUnreadMessageCount(data.receiver);
+      await this.broadcastSavedMessage(saved);
+      const unreadData = await this.chatService.getUnreadMessageCount(
+        data.receiver,
+      );
+      await this.blocks.assertVisible(
+        client.data.userId,
+        data.receiver,
+        'Conversation not found',
+      );
       this.server.to(`user:${data.receiver}`).emit('unreadData', unreadData);
       return saved;
     } catch (error) {
@@ -153,6 +211,11 @@ export class ChatGateway implements OnGatewayInit, OnGatewayConnection, OnGatewa
         limit: data?.limit,
         before: data?.before,
       });
+      await this.blocks.assertVisible(
+        client.data.userId,
+        data.user2,
+        'Conversation not found',
+      );
       client.emit('chatHistory', history);
     } catch (error) {
       this.emitError(client, error);
@@ -170,6 +233,7 @@ export class ChatGateway implements OnGatewayInit, OnGatewayConnection, OnGatewa
       client.emit('unreadMessageCount', unread);
       // Keep the reader's other devices in sync.
       client.to(`user:${userId}`).emit('unreadMessageCount', unread);
+      await this.blocks.assertVisible(userId, data.user2, 'Conversation not found');
       this.server.to(`user:${data.user2}`).emit('messagesRead', { userId });
     } catch (error) {
       this.emitError(client, error);
@@ -192,7 +256,10 @@ export class ChatGateway implements OnGatewayInit, OnGatewayConnection, OnGatewa
 
   @SubscribeMessage('getUnreadCount')
   async handleGetUnreadCount(@ConnectedSocket() client: Socket) {
-    client.emit('unreadMessageCount', await this.chatService.getUnreadMessageCount(client.data.userId));
+    client.emit(
+      'unreadMessageCount',
+      await this.chatService.getUnreadMessageCount(client.data.userId),
+    );
   }
 
   /**
@@ -201,31 +268,42 @@ export class ChatGateway implements OnGatewayInit, OnGatewayConnection, OnGatewa
    * verified when it joined). `isTyping: false` clears the indicator.
    */
   @SubscribeMessage('typing')
-  handleTyping(
+  async handleTyping(
     @MessageBody() data: { receiver?: string; groupId?: string; isTyping?: boolean },
     @ConnectedSocket() client: Socket,
   ) {
     const sender = client.data.userId;
     const isTyping = data?.isTyping !== false;
-    if (data?.groupId) {
-      const room = `group:${data.groupId}`;
-      if (ObjectId.isValid(data.groupId) && client.rooms?.has(room)) {
-        client.to(room).emit('typing', { sender, groupId: data.groupId, isTyping });
+    try {
+      if (data?.groupId) {
+        const room = `group:${data.groupId}`;
+        if (ObjectId.isValid(data.groupId) && client.rooms?.has(room)) {
+          await this.chatService.assertGroupMember(sender, data.groupId);
+          client.to(room).emit('typing', { sender, groupId: data.groupId, isTyping });
+        }
+        return;
       }
-      return;
+      if (!ObjectId.isValid(data?.receiver) || data.receiver === sender) return;
+      await this.chatService.assertCanSendDirect(sender, data.receiver);
+      this.server.to(`user:${data.receiver}`).emit('typing', { sender, isTyping });
+    } catch (error) {
+      this.emitError(client, error);
     }
-    if (!ObjectId.isValid(data?.receiver) || data.receiver === sender) return;
-    this.server.to(`user:${data.receiver}`).emit('typing', { sender, isTyping });
   }
 
   @SubscribeMessage('updateMessage')
   async handleUpdateMessage(
-    @MessageBody() data: { messageId: string; userId?: string; newMessage: string },
+    @MessageBody()
+    data: { messageId: string; userId?: string; newMessage: string },
     @ConnectedSocket() client: Socket,
   ) {
     try {
-      const updated = await this.chatService.updateMessage(data.messageId, client.data.userId, data.newMessage);
-      this.broadcastSavedMessage(updated, 'messageUpdated');
+      const updated = await this.chatService.updateMessage(
+        data.messageId,
+        client.data.userId,
+        data.newMessage,
+      );
+      await this.broadcastSavedMessage(updated, 'messageUpdated');
       return updated;
     } catch (error) {
       this.emitError(client, error);
@@ -238,8 +316,11 @@ export class ChatGateway implements OnGatewayInit, OnGatewayConnection, OnGatewa
     @ConnectedSocket() client: Socket,
   ) {
     try {
-      const deleted = await this.chatService.deleteMessage(data.messageId, client.data.userId);
-      this.broadcastSavedMessage(
+      const deleted = await this.chatService.deleteMessage(
+        data.messageId,
+        client.data.userId,
+      );
+      await this.broadcastSavedMessage(
         { ...deleted, messageId: data.messageId },
         'messageDeleted',
       );
@@ -254,8 +335,14 @@ export class ChatGateway implements OnGatewayInit, OnGatewayConnection, OnGatewa
     @ConnectedSocket() client: Socket,
   ) {
     try {
-      if (data.media?.length) throw new Error('Attachments must use the authenticated upload endpoint');
-      await this.chatService.assertGroupMember(client.data.userId, data.groupId);
+      if (data.media?.length)
+        throw new Error(
+          'Attachments must use the authenticated upload endpoint',
+        );
+      await this.chatService.assertGroupMember(
+        client.data.userId,
+        data.groupId,
+      );
       const saved = await this.chatService.saveTextMessage({
         sender: client.data.userId,
         groupId: data.groupId,
@@ -264,7 +351,7 @@ export class ChatGateway implements OnGatewayInit, OnGatewayConnection, OnGatewa
         clientId: data.clientId,
         ttlSeconds: data.ttlSeconds,
       });
-      this.broadcastSavedMessage(saved);
+      await this.broadcastSavedMessage(saved);
       return saved;
     } catch (error) {
       this.emitError(client, error);
@@ -281,22 +368,49 @@ export class ChatGateway implements OnGatewayInit, OnGatewayConnection, OnGatewa
         limit: data?.limit,
         before: data?.before,
       });
+      await this.chatService.assertGroupMember(client.data.userId, data.groupId);
       client.emit('groupChatHistory', history);
     } catch (error) {
       this.emitError(client, error);
     }
   }
 
-  broadcastSavedMessage(message: any, event?: string) {
+  async broadcastSavedMessage(message: any, event?: string) {
     if (!this.server) return;
+    if (this.chatService.canDeliverMessage && !await this.chatService.canDeliverMessage(message)) return;
     const senderId = String(message.sender?._id || message.sender);
     if (message.groupId) {
-      this.server.to(`group:${message.groupId}`).emit(event || 'receiveGroupMessage', message);
+      // Deliver to current members, never to a stale subscription. Recheck each
+      // member immediately before emission; removals cannot keep receiving data.
+      for (const id of await this.blocks.groupMembers(
+        String(message.groupId),
+      )) {
+        try {
+          await this.chatService.assertGroupMember(id, String(message.groupId));
+        } catch {
+          this.server.in(`user:${id}`).socketsLeave(`group:${message.groupId}`);
+          continue;
+        }
+        const blockedSender = await this.blocks.isBlockedEitherWay(
+          senderId,
+          id,
+        );
+        this.server
+          .to(`user:${id}`)
+          .emit(event || 'receiveGroupMessage', {
+            ...message,
+            // Withhold blocked content server-side; never trust the client to hide it.
+            ...(blockedSender ? { message: '', media: [] } : {}),
+            blockedSender,
+          });
+      }
       return;
     }
+    const receiverId = String(message.receiver?._id || message.receiver);
+    if (await this.blocks.isBlockedEitherWay(senderId, receiverId)) return;
     // One emit to both rooms: Socket.IO delivers once per socket.
     this.server
-      .to([`user:${senderId}`, `user:${message.receiver?._id || message.receiver}`])
+      .to([`user:${senderId}`, `user:${receiverId}`])
       .emit(event || 'receiveMessage', message);
   }
 
@@ -324,16 +438,23 @@ export class ChatGateway implements OnGatewayInit, OnGatewayConnection, OnGatewa
     this.server.in(room).socketsLeave(room);
   }
 
+  /** Over sockets, which bypass photo signing: clients refetch the image. */
   private groupSummary(group: any) {
     return {
       _id: String(group._id),
       name: group.name,
       description: group.description,
-      groupIcon: group.groupIcon,
       admin: String(group.admin),
       memberCount: group.members?.length || 0,
       updatedAt: group.updatedAt,
     };
+  }
+
+  private async broadcastPresence(actor: string, event: string) {
+    for (const viewer of this.userSockets.keys()) {
+      if (!(await this.blocks.isBlockedEitherWay(actor, viewer)))
+        this.server.to(`user:${viewer}`).emit(event, { adminId: actor });
+    }
   }
 
   private emitError(client: Socket, error: any) {
@@ -345,15 +466,16 @@ export class ChatGateway implements OnGatewayInit, OnGatewayConnection, OnGatewa
 
   private async authenticateClient(client: Socket) {
     const supplied = client.handshake.auth?.token;
-    const token = typeof supplied === 'string'
-      ? supplied.replace(/^Bearer\s+/i, '')
-      : '';
+    const token =
+      typeof supplied === 'string' ? supplied.replace(/^Bearer\s+/i, '') : '';
     if (!token) throw new Error('Missing authentication token');
     const payload = await this.jwtService.verifyAsync(token);
     const userId = String(payload?.sub || '');
-    if (!ObjectId.isValid(userId)) throw new Error('Invalid authentication token');
+    if (!ObjectId.isValid(userId))
+      throw new Error('Invalid authentication token');
     const user = await this.chatService.getUserById(userId);
     if (!user) throw new Error('Invalid authentication token');
+    await this.photos.assertActiveAccount(userId);
     client.data.userId = userId;
   }
 }

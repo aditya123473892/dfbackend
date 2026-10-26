@@ -1,15 +1,20 @@
 import { ApiHideProperty, ApiProperty } from '@nestjs/swagger';
 import { Type } from 'class-transformer';
-import { IsNotEmpty, IsOptional, IsDate, IsString, IsEnum, IsArray, IsNumber, ValidateNested } from 'class-validator';
+import {
+  IsNotEmpty,
+  IsOptional,
+  IsDate,
+  IsString,
+  IsEnum,
+  IsArray,
+  IsNumber,
+  ValidateNested,
+  IsUUID,
+} from 'class-validator';
 import { MediaDto } from 'src/common/dtos/utils.dto/media.dto';
 import { EventType } from 'src/common/schemas/events.schema';
 
 export class CreateEventDto {
-
-  @ApiHideProperty()
-  @IsOptional()
-  creator: string;
-
   @ApiProperty()
   @IsNotEmpty()
   name: string;
@@ -48,9 +53,11 @@ export class CreateEventDto {
   @IsOptional()
   registrationDeadline: Date;
 
-  @ApiProperty({ type: MediaDto, default: {} })
   @IsOptional()
-  @ValidateNested({ each: false })
-  @Type(() => MediaDto)
-  cover: MediaDto;
+  @IsUUID('4')
+  coverUploadId?: string;
+
+  // Internal fields are assigned explicitly by the controller, never taken from clients.
+  creator?: string;
+  cover?: MediaDto;
 }

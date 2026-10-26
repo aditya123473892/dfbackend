@@ -5,7 +5,7 @@
   "description": "Dark fantacy backend",
   "license": "MIT",
   "engines": {
-    "node": "18.18.1"
+    "node": ">=22"
   },
   "scripts": {
     "build": "nest build",
@@ -15,6 +15,7 @@
     "dev:node18": "node ./node_modules/@nestjs/cli/bin/nest.js start --watch",
     "dev:direct": "node ./node_modules/@nestjs/cli/bin/nest.js start --watch",
     "db:import": "node scripts/import-mongo-dump.js",
+    "db:check": "node scripts/check-db.cjs",
     "start:debug": "nest start --debug --watch",
     "start:prod": "node -r ./dist/src/register-paths.js dist/src/main",
     "lint": "eslint \"{src,apps,libs,test}/**/*.ts\" --fix",
@@ -23,13 +24,23 @@
     "test:cov": "jest --coverage",
     "test:debug": "node --inspect-brk -r tsconfig-paths/register -r ts-node/register node_modules/.bin/jest --runInBand",
     "test:e2e": "jest --config ./test/jest-e2e.json",
-    "prebuild": "npm i -g @nestjs/cli && rimraf dist",
+    "prebuild": "node -e \"console.log('Building backend with local toolchain')\"",
+    "photos:migrate": "ts-node -r tsconfig-paths/register scripts/migrate-photos.ts",
+    "premium:backfill": "ts-node -r tsconfig-paths/register scripts/backfill-premium.ts",
+    "premium:test-user": "ts-node -r tsconfig-paths/register scripts/set-test-premium.ts",
+    "s3:test": "node scripts/s3-smoke-test.js --sample",
+    "otp:indexes": "ts-node -r tsconfig-paths/register scripts/phone-otp-indexes.ts",
     "db:repair-post-interactions": "node scripts/repair-post-interactions.js",
     "test:integration": "jest --config ./test/jest-integration.json --runInBand",
     "db:normalize-chat-ids": "node scripts/normalize-chat-ids.js",
     "test:smoke": "node test/smoke/e2e-smoke.js . .."
   },
   "dependencies": {
+    "@aws-sdk/client-rekognition": "^3.1152.0",
+    "@aws-sdk/client-s3": "^3.1152.0",
+    "@aws-sdk/client-ses": "^3.1152.0",
+    "@aws-sdk/s3-presigned-post": "^3.1152.0",
+    "@aws-sdk/s3-request-presigner": "^3.1152.0",
     "@nestjs-modules/mailer": "^1.11.2",
     "@nestjs/bull": "^10.1.0",
     "@nestjs/common": "^10.3.3",
@@ -47,13 +58,13 @@
     "@nestjs/websockets": "^10.3.4",
     "@types/bcrypt": "^5.0.2",
     "archiver": "^7.0.0",
-    "aws-sdk": "^2.1573.0",
     "bcrypt": "^5.1.1",
     "bull": "^4.12.2",
     "class-transformer": "^0.5.1",
     "class-validator": "^0.14.1",
     "handlebars": "^4.7.8",
     "input": "^1.0.1",
+    "libphonenumber-js": "^1.13.15",
     "moment-timezone": "^0.5.45",
     "mongoose": "^8.2.1",
     "nodemailer": "^6.9.11",
@@ -62,7 +73,10 @@
     "passport-jwt": "^4.0.1",
     "reflect-metadata": "^0.2.2",
     "rxjs": "^7.8.1",
-    "stripe": "^17.6.0"
+    "sharp": "^0.34.5",
+    "stripe": "^17.6.0",
+    "twilio": "^5.13.1",
+    "zod": "4.1.12"
   },
   "devDependencies": {
     "@nestjs/cli": "^10.3.2",
@@ -100,7 +114,12 @@
     "rootDir": "src",
     "testRegex": ".*\\.spec\\.ts$",
     "transform": {
-      "^.+\\.(t|j)s$": "ts-jest"
+      "^.+\\.(t|j)s$": [
+        "ts-jest",
+        {
+          "isolatedModules": true
+        }
+      ]
     },
     "moduleNameMapper": {
       "^src/(.*)$": "<rootDir>/$1"

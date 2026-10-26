@@ -48,6 +48,7 @@ export class EventMembersService {
 
   async update(id: string, updateEventMemberDto: UpdateEventMemberDto, userId: string) {
     const updatedMember = await this.eventsMembersModel.findById(id).populate(['user', 'event']) as EventMembersDocument;
+    if (!updatedMember) throw new BadRequestException(`Event member with ID- ${id} not found.`);
     let receiverId
     if (updatedMember.user && '_id' in updatedMember.user) {
       receiverId = updatedMember.user._id.toString();

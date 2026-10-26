@@ -3,23 +3,18 @@ import {
   ForbiddenException,
   Injectable,
   NotFoundException,
-  UnsupportedMediaTypeException,
 } from '@nestjs/common';
 import { InjectModel } from '@nestjs/mongoose';
-import { randomUUID } from 'crypto';
 import { Model, Types } from 'mongoose';
 import { Group, GroupDocument } from '../common/schemas/group-chat.schema';
 import { Users, UsersDocument } from 'src/common/schemas';
 import {
   anyId,
   ChatService,
-  groupIconStorageKey,
   idForms,
-  hasValidMediaSignature,
   PUBLIC_USER_FIELDS,
 } from 'src/chats/chats.service';
 import { ChatGateway } from 'src/chats/chats.gateway';
-import { S3BucketService } from 'src/s3-bucket/s3-bucket.service';
 import {
   CreateGroupDto,
   MAX_GROUP_DESCRIPTION_LENGTH,
@@ -29,13 +24,9 @@ import {
 import { AddMembersDto } from './dtos/add-member.dto';
 import { RemoveMembersDto } from './dtos/remove-member.dto';
 import { UpdateGroupDto } from './dtos/update-group.dto';
-
-const ICON_TYPES: Record<string, string> = {
-  'image/jpeg': 'jpg',
-  'image/png': 'png',
-  'image/webp': 'webp',
-};
-const MAX_ICON_BYTES = 5 * 1024 * 1024;
+import { BlockService } from '../user-blocks/block.service';
+import { preservationGate } from '../reports/preservation';
+import { PhotosService } from '../photos/photos.service';
 
 const uniqueIds = (ids: string[]) => [...new Set(ids.map(String))];
 
@@ -51,7 +42,8 @@ export class GroupService {
     @InjectModel(Users.name) private usersModel: Model<UsersDocument>,
     private readonly chatService: ChatService,
     private readonly chatGateway: ChatGateway,
-    private readonly s3BucketService: S3BucketService,
+    private readonly blocks: BlockService,
+    private readonly photos: PhotosService,
   ) {}
 
   async createGroup(dto: CreateGroupDto, actorId: string) {
@@ -67,6 +59,7 @@ export class GroupService {
       if (existing) return this.toClientGroup(existing);
     }
     await this.assertUsersAvailable(memberIds);
+    await this.assertStillVisible(actorId, memberIds);
 
     let group: GroupDocument;
     try {
@@ -85,6 +78,13 @@ export class GroupService {
       }
       throw error;
     }
+    // A block committed between the check and the save must still win.
+    try {
+      await this.assertStillVisible(actorId, memberIds);
+    } catch (error) {
+      await this.groupModel.deleteOne({ _id: group._id });
+      throw error;
+    }
     const allMembers = [actorId, ...memberIds];
     await this.chatService.initializeGroupReadCursors(String(group._id), allMembers);
     this.chatGateway.syncGroupMembership(group, allMembers);
@@ -97,6 +97,7 @@ export class GroupService {
     const added = uniqueIds(dto.members).filter((id) => !current.has(id));
     if (!added.length) return this.toClientGroup(group);
     await this.assertUsersAvailable(added);
+    await this.assertStillVisible(actorId, added);
     const maxCurrent = MAX_GROUP_MEMBERS - added.length;
     if (maxCurrent < 0) throw new BadRequestException(`Groups are limited to ${MAX_GROUP_MEMBERS} members`);
     // The size condition is part of the update so concurrent adds cannot
@@ -111,26 +112,39 @@ export class GroupService {
       { new: true },
     );
     if (!updated) throw new BadRequestException(`Groups are limited to ${MAX_GROUP_MEMBERS} members`);
+    try {
+      await this.assertStillVisible(actorId, added);
+    } catch (error) {
+      await this.groupModel.updateOne(
+        { _id: group._id },
+        { $pull: { members: { $in: idForms(added) } } },
+      );
+      throw error;
+    }
     await this.chatService.initializeGroupReadCursors(String(updated._id), added);
     this.chatGateway.syncGroupMembership(updated, added);
     return this.toClientGroup(updated);
   }
 
   async removeMembers(dto: RemoveMembersDto, actorId: string) {
-    const group = await this.findOwnedGroup(dto.groupId, actorId);
-    const removed = uniqueIds(dto.members);
-    if (removed.includes(String(group.admin))) {
-      throw new ForbiddenException('The group owner cannot be removed');
-    }
-    const updated = await this.groupModel.findOneAndUpdate(
-      { _id: group._id, admin: anyId(actorId) },
-      { $pull: { members: { $in: idForms(removed) } } },
-      { new: true },
-    );
-    if (!updated) throw new NotFoundException('Group not found');
-    await this.chatService.removeGroupReadCursors(String(updated._id), removed);
-    this.chatGateway.syncGroupMembership(updated, [], removed);
-    return this.toClientGroup(updated);
+    return preservationGate(this.groupModel.db, async () => {
+      const group = await this.findOwnedGroup(dto.groupId, actorId);
+      const removed = uniqueIds(dto.members);
+      if (removed.includes(String(group.admin))) {
+        throw new ForbiddenException('The group owner cannot be removed');
+      }
+      await this.recordDepartures(group, removed);
+      const updated = await this.groupModel.findOneAndUpdate(
+        { _id: group._id, admin: anyId(actorId) },
+        { $pull: { members: { $in: idForms(removed) } } },
+        { new: true },
+      );
+      if (!updated) throw new NotFoundException('Group not found');
+      await this.chatService.removeGroupReadCursors(String(updated._id), removed);
+      this.blocks.groupRemoval$.next({ groupId: String(updated._id), members: removed });
+      this.chatGateway.syncGroupMembership(updated, [], removed);
+      return this.toClientGroup(updated);
+    });
   }
 
   /**
@@ -138,23 +152,27 @@ export class GroupService {
    * longest-standing remaining member; the last member leaving deletes the group.
    */
   async leaveGroup(groupId: string, actorId: string) {
-    const group = await this.findMemberGroup(groupId, actorId);
-    const remaining = group.members.map(String).filter((id) => id !== actorId);
-    if (!remaining.length) {
-      await this.deleteOwnedGroup(group);
-      return { groupId, left: true, deleted: true };
-    }
-    const update: any = { $pull: { members: { $in: idForms([actorId]) } } };
-    if (String(group.admin) === actorId) update.$set = { admin: new Types.ObjectId(remaining[0]) };
-    const updated = await this.groupModel.findOneAndUpdate(
-      { _id: group._id, members: anyId(actorId) },
-      update,
-      { new: true },
-    );
-    if (!updated) throw new NotFoundException('Group not found');
-    await this.chatService.removeGroupReadCursors(groupId, [actorId]);
-    this.chatGateway.syncGroupMembership(updated, [], [actorId]);
-    return { groupId, left: true, deleted: false, admin: String(updated.admin) };
+    return preservationGate(this.groupModel.db, async () => {
+      const group = await this.findMemberGroup(groupId, actorId);
+      const remaining = group.members.map(String).filter((id) => id !== actorId);
+      if (!remaining.length) {
+        await this.deleteOwnedGroup(group);
+        return { groupId, left: true, deleted: true };
+      }
+      await this.recordDepartures(group, [actorId]);
+      const update: any = { $pull: { members: { $in: idForms([actorId]) } } };
+      if (String(group.admin) === actorId) update.$set = { admin: new Types.ObjectId(remaining[0]) };
+      const updated = await this.groupModel.findOneAndUpdate(
+        { _id: group._id, members: anyId(actorId) },
+        update,
+        { new: true },
+      );
+      if (!updated) throw new NotFoundException('Group not found');
+      await this.chatService.removeGroupReadCursors(groupId, [actorId]);
+      this.blocks.groupRemoval$.next({ groupId, members: [actorId] });
+      this.chatGateway.syncGroupMembership(updated, [], [actorId]);
+      return { groupId, left: true, deleted: false, admin: String(updated.admin) };
+    });
   }
 
   async deleteGroup(groupId: string, actorId: string) {
@@ -181,26 +199,22 @@ export class GroupService {
     return Types.ObjectId.isValid(_id) ? this.groupModel.findById(_id) : null;
   }
 
-  async uploadGroupIcon(groupId: string, file: Express.Multer.File, actorId: string) {
-    const group = await this.findOwnedGroup(groupId, actorId);
-    if (!file) throw new BadRequestException('Choose an image');
-    const extension = ICON_TYPES[file.mimetype?.toLowerCase()];
-    if (!extension || !hasValidMediaSignature(file.mimetype.toLowerCase(), file.buffer)) {
-      throw new UnsupportedMediaTypeException('Group images must be JPEG, PNG or WebP');
-    }
-    if (file.size > MAX_ICON_BYTES) throw new BadRequestException('Group images must be 5 MB or smaller');
-    const key = `groupIcon/${randomUUID()}.${extension}`;
-    if (!(await this.s3BucketService.uploadPrivateFile(file, key))) {
-      throw new BadRequestException('Failed to upload the group image');
-    }
-    const previousKey = group.groupIconKey;
-    group.groupIconKey = key;
-    group.groupIcon = undefined;
-    await group.save();
-    if (previousKey) await this.s3BucketService.deleteOne(previousKey);
-    const client = await this.toClientGroup(group);
-    this.chatGateway.syncGroupMembership({ ...client, members: group.members });
-    return client;
+  /** Sets the group image from an approved direct upload (owner only). */
+  async uploadGroupIcon(groupId: string, uploadId: string, actorId: string) {
+    const current = await this.findOwnedGroup(groupId, actorId);
+    const ref = `group:${groupId}`;
+    const [photo] = await this.photos.bind(actorId, [uploadId], ref);
+    const group = await this.photos.replaceImage(
+      'Groups',
+      groupId,
+      'groupIcon',
+      current.groupIcon,
+      photo.filename,
+    );
+    if (current.groupIcon && current.groupIcon !== photo.filename)
+      await this.photos.retire(ref, [current.groupIcon]);
+    this.chatGateway.syncGroupMembership({ ...group, members: current.members });
+    return this.toClientGroup(group);
   }
 
   async getGroupMembers(groupId: string, actorId: string) {
@@ -215,21 +229,37 @@ export class GroupService {
     return this.toClientGroup(group);
   }
 
-  /** Signs the group image for display; storage keys are never returned. */
+  /**
+   * Response shape of a group. The `groupIcon` storage reference is signed by
+   * PhotoResponseInterceptor; idempotency keys are never returned.
+   */
   async toClientGroup(group: GroupDocument | any) {
     const source = group?.toObject ? group.toObject() : { ...group };
-    const groupIcon = await this.chatService.groupIconUrl(source);
     const { groupIconKey, clientId, ...rest } = source;
-    return { ...rest, groupIcon };
+    return { ...rest, groupIcon: source.groupIcon || groupIconKey };
   }
 
   private async deleteOwnedGroup(group: GroupDocument) {
     const groupId = String(group._id);
     await this.groupModel.deleteOne({ _id: group._id });
     await this.chatService.deleteGroupConversation(groupId);
-    const key = groupIconStorageKey(group);
-    if (key) await this.s3BucketService.deleteOne(key);
+    const icon = group.groupIcon || group.groupIconKey;
+    if (icon) await this.photos.retire(`group:${groupId}`, [icon]);
     this.chatGateway.broadcastGroupDeleted(groupId);
+  }
+
+  /** Report evidence keeps which conversations a former member could read. */
+  private async recordDepartures(group: GroupDocument, userIds: string[]) {
+    if (!this.groupModel.db?.getClient) return;
+    const groupId = String(group._id);
+    for (const member of group.members.map(String)) {
+      if (!userIds.includes(member)) continue;
+      await this.groupModel.db.db.collection<any>('ReportMemberships').updateOne(
+        { _id: `${groupId}:${member}` },
+        { $set: { groupId, userId: member, leftAt: new Date() } },
+        { upsert: true },
+      );
+    }
   }
 
   private async findMemberGroup(groupId: string, actorId: string) {
@@ -245,9 +275,16 @@ export class GroupService {
   private async findOwnedGroup(groupId: string, actorId: string) {
     const group = await this.findMemberGroup(groupId, actorId);
     if (String(group.admin) !== actorId) {
-      throw new ForbiddenException('Only the group owner can perform this action');
+      throw new ForbiddenException(
+        'Only the group owner can perform this action',
+      );
     }
     return group;
+  }
+
+  private async assertStillVisible(actorId: string, members: string[]) {
+    for (const member of members)
+      await this.blocks.assertVisible(actorId, member);
   }
 
   private async assertUsersAvailable(userIds: string[]) {
