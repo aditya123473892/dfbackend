@@ -1,5 +1,6 @@
 import {
   BadRequestException,
+  ConflictException,
   ForbiddenException,
   Injectable,
   NotFoundException,
@@ -56,7 +57,7 @@ export class GroupService {
     }
     if (dto.clientId) {
       const existing = await this.groupModel.findOne({ admin: anyId(actorId), clientId: dto.clientId });
-      if (existing) return this.toClientGroup(existing);
+      if (existing) return this.sameRequest(existing, name);
     }
     await this.assertUsersAvailable(memberIds);
     await this.assertStillVisible(actorId, memberIds);
@@ -74,7 +75,7 @@ export class GroupService {
       // A concurrent retry with the same clientId created the group first.
       if (error?.code === 11000 && dto.clientId) {
         const existing = await this.groupModel.findOne({ admin: anyId(actorId), clientId: dto.clientId });
-        if (existing) return this.toClientGroup(existing);
+        if (existing) return this.sameRequest(existing, name);
       }
       throw error;
     }
@@ -227,6 +228,13 @@ export class GroupService {
     const isMember = group.members.some((member: any) => String(member?._id || member) === actorId);
     if (!isMember) throw new ForbiddenException('Group membership required');
     return this.toClientGroup(group);
+  }
+
+  /** The idempotency key belongs to one create request; reusing it for another is a conflict. */
+  private sameRequest(existing: GroupDocument, name: string) {
+    if (existing.name !== name)
+      throw new ConflictException('This request was already used to create a different group');
+    return this.toClientGroup(existing);
   }
 
   /**

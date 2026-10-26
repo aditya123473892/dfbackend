@@ -39,6 +39,8 @@ export default class GlobalExceptionFilter implements ExceptionFilter {
           : error?.response?.message
             ? error?.response?.message
             : error.message || 'Internal Server Error',
+      // Field-level validation details (see applicationValidationPipe).
+      ...(status < 500 && error?.response?.errors ? { errors: error.response.errors } : {}),
     });
   }
 }

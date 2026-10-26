@@ -12,6 +12,10 @@ import {
   Matches,
 } from 'class-validator';
 
+/** Photos per post (carousel). Other resources keep the 5-photo limit. */
+export const POST_MAX_IMAGES = 10;
+export const MAX_IMAGES_PER_RESOURCE = 5;
+
 export class UploadUrlDto {
   @IsIn(['image/jpeg', 'image/webp']) contentType: 'image/jpeg' | 'image/webp';
   @IsString() @Matches(/^[A-Za-z0-9_-]{8,64}$/) requestId: string;

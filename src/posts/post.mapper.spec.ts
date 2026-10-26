@@ -24,7 +24,8 @@ describe('PostMapper', () => {
     const response = await mapper.toResponse(post, viewer, media);
     expect(response.locked).toBe(locked);
     expect(response.images[0].url).toBe(locked ? 'https://cdn.test/previews/blurred.jpg' : 'https://s3.test/original.jpg?X-Amz-Signature=secret');
-    expect(Object.keys(response.images[0]).sort()).toEqual(['blurhash', 'height', 'id', 'url', 'width']);
+    expect(Object.keys(response.images[0]).sort()).toEqual(['aspectRatio', 'blurhash', 'height', 'id', 'url', 'width']);
+    expect(response.images[0]).toMatchObject({ width: 1080, height: 720, aspectRatio: 1.5 });
     expect(isMappedPostImage(response.images[0])).toBe(true);
     const json = JSON.stringify(response);
     for (const field of ['originalKey', 'previewKey', 'filename', 'storageKey', 'secret-original', 'secret-storage']) expect(json).not.toContain(field);

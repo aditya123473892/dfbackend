@@ -24,6 +24,7 @@ import { canReadPost } from '../posts/post-access';
 import { Subject } from 'rxjs';
 import { S3BucketService } from '../s3-bucket/s3-bucket.service';
 import { MediaService, originalUrlSeconds } from './media.service';
+import { MAX_IMAGES_PER_RESOURCE, POST_MAX_IMAGES } from './photo.dto';
 import { PostMapper, isMappedPostImage, isPremium } from '../posts/post.mapper';
 
 @Injectable()
@@ -246,7 +247,7 @@ export class PhotosService implements OnModuleInit {
       throw new BadRequestException('Invalid resource context');
     if (
       !Array.isArray(ids) ||
-      ids.length > 5 ||
+      ids.length > (context.resourceType === 'post' ? POST_MAX_IMAGES : MAX_IMAGES_PER_RESOURCE) ||
       new Set(ids).size !== ids.length
     )
       throw new BadRequestException('Invalid photo list');

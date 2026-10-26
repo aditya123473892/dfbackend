@@ -62,6 +62,15 @@ hostname directly. Start the backend after MongoDB has elected its primary.
 => Ensure `.env` variables are set correctly.
 => Restart the server after modifying environment variables
 
+## API contract notes
+
+- **Validation errors:** every 400 from the validation pipe keeps the `message` list and adds
+  `errors`, a map of field name to messages (e.g. `{ "name": ["name should not be empty"] }`).
+- **Groups:** any signed-in user can create a group and becomes its owner. A retry with the same
+  `clientId` returns the stored group; reusing that `clientId` for a different group returns 409.
+- **Post images:** each image is `{ id, url, blurhash, width, height, aspectRatio }`; `aspectRatio`
+  is `width / height` or `null` until a legacy row is backfilled. A post holds up to 10 photos.
+
 ## Phone OTP sign-in (Twilio Verify)
 
 The mobile app signs in with a phone number and SMS code only. The web app's

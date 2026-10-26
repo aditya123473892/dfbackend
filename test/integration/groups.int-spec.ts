@@ -1,4 +1,4 @@
-import { BadRequestException, ForbiddenException } from '@nestjs/common';
+import { BadRequestException, ConflictException, ForbiddenException } from '@nestjs/common';
 import { Types } from 'mongoose';
 import { Harness, clientId } from './harness';
 
@@ -41,6 +41,16 @@ describe('Groups (MongoDB integration)', () => {
       Array.from({ length: 4 }, () => h.groups.createGroup({ name: 'Once', members: [a], clientId: key }, owner)),
     );
     expect(new Set(results.map((group) => String(group._id))).size).toBe(1);
+    expect(await h.models.Group.countDocuments()).toBe(1);
+  });
+
+  it('rejects a clientId reused for a different group with a conflict', async () => {
+    const [owner, a] = await h.users(2);
+    const key = clientId();
+    await h.groups.createGroup({ name: 'First', members: [a], clientId: key }, owner);
+    await expect(
+      h.groups.createGroup({ name: 'Second', members: [a], clientId: key }, owner),
+    ).rejects.toBeInstanceOf(ConflictException);
     expect(await h.models.Group.countDocuments()).toBe(1);
   });
 

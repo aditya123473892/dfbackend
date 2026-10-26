@@ -34,8 +34,11 @@ export class PostMapper {
         id: String(image.photoId || image._id || `${post._id}:${index}`),
         url: locked ? delivery.preview(image.previewKey) : await delivery.original(image),
         blurhash: image.blurhash || null,
+        // Stored after EXIF orientation is applied; null for legacy rows until backfilled.
         width: image.width || null,
         height: image.height || null,
+        aspectRatio:
+          image.width > 0 && image.height > 0 ? Math.round((image.width / image.height) * 10000) / 10000 : null,
       };
       Object.defineProperty(result, mappedImage, { value: true });
       return result;
