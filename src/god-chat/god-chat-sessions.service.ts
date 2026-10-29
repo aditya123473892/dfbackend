@@ -9,10 +9,16 @@ import {
 import { InjectConnection } from '@nestjs/mongoose';
 import { Connection, Types } from 'mongoose';
 import { z } from 'zod';
+import type { GuardFlag } from './guardrails';
 
-/** Oldest messages are dropped past this so one session document stays small. */
-export const MAX_STORED_MESSAGES = 200;
+/**
+ * Oldest messages are dropped past this so one session document stays well under Mongo's
+ * 16MB limit (1000 messages of at most 4000 characters is about 4MB). Long chats are
+ * summarised for the model well before this, so dropping only shortens the stored transcript.
+ */
+export const MAX_STORED_MESSAGES = 1000;
 const PAGE = 30;
+const PREVIEW_CHARS = 140;
 /** A session with a message this recent is shown to admins as "live". */
 export const LIVE_WINDOW_MS = 10 * 60_000;
 
@@ -25,7 +31,11 @@ export type StoredMessage = {
   staffId?: Types.ObjectId;
   content: string;
   at: Date;
+  /** Guardrail results, shown to admins only. */
+  flags?: GuardFlag[];
 };
+/** Summary of the conversation up to and including message `throughId`, sent to the model in place of those messages. */
+export type SessionSummary = { text: string; throughId: string; at: Date };
 export type StoredSession = {
   _id: Types.ObjectId;
   userId: Types.ObjectId;
@@ -34,6 +44,14 @@ export type StoredSession = {
   staffId?: Types.ObjectId;
   takenOverAt?: Date;
   messages: StoredMessage[];
+  /** Every guardrail flag this session has raised. */
+  flags?: GuardFlag[];
+  /** True until an admin marks the flagged chat as reviewed. */
+  flagged?: boolean;
+  flaggedAt?: Date;
+  summary?: SessionSummary;
+  /** Id of the last member message the AI answered, so two requests never answer it twice. */
+  answeredThrough?: string;
   createdAt: Date;
   updatedAt: Date;
   closedAt?: Date;
@@ -43,9 +61,12 @@ const objectId = z.string().regex(/^[a-f\d]{24}$/i);
 const clientId = z.string().trim().min(8).max(64).regex(/^[\w-]+$/);
 export const staffMessageInput = z.object({ id: clientId, content: z.string().trim().min(1).max(2000) }).strict();
 export const sessionListInput = z.object({
-  filter: z.enum(['open', 'live', 'staff']).default('open'),
+  filter: z.enum(['open', 'live', 'staff', 'flagged', 'ended', 'all']).default('open'),
   before: z.string().datetime().optional(),
+  /** Only this member's sessions, e.g. to see their past chats. */
+  userId: objectId.optional(),
 }).strict();
+export const historyInput = z.object({ before: z.string().datetime().optional() }).strict();
 export function parseSessions<T>(schema: z.ZodType<T>, value: unknown): T {
   const result = schema.safeParse(value ?? {});
   if (!result.success) throw new BadRequestException('Invalid God chat request');
@@ -57,6 +78,15 @@ const toId = (value: string) => {
 };
 
 const USER_FIELDS = { username: 1, displayname: 1, firstName: 1, lastName: 1, avatar: 1 };
+const isLive = (row: { open: boolean; updatedAt: Date }) =>
+  row.open && Date.now() - new Date(row.updatedAt).getTime() < LIVE_WINDOW_MS;
+
+/** Raising a flag puts the session on the admins' "Flagged" list. */
+function flagUpdate(flags: GuardFlag[], now: Date) {
+  return flags.length
+    ? { set: { flagged: true, flaggedAt: now }, addToSet: { $addToSet: { flags: { $each: flags } } } }
+    : { set: {}, addToSet: {} };
+}
 
 /** Persisted "Chat with God" conversations, readable and takeable by admins. */
 @Injectable()
@@ -75,6 +105,11 @@ export class GodChatSessionsService implements OnModuleInit {
         { unique: true, partialFilterExpression: { open: true }, name: 'one_open_session_per_user' },
       );
       await this.sessions.createIndex({ open: 1, updatedAt: -1 }, { name: 'open_by_activity' });
+      await this.sessions.createIndex({ userId: 1, updatedAt: -1 }, { name: 'member_history' });
+      await this.sessions.createIndex(
+        { flagged: 1, updatedAt: -1 },
+        { partialFilterExpression: { flagged: true }, name: 'flagged_by_activity' },
+      );
     } catch (error) {
       this.logger.warn(`GodChatSessions indexes not created: ${(error as Error).message}`);
     }
@@ -86,18 +121,24 @@ export class GodChatSessionsService implements OnModuleInit {
     return this.sessions.findOne({ userId: new Types.ObjectId(userId), open: true });
   }
 
+  findById(id: Types.ObjectId) {
+    return this.sessions.findOne({ _id: id });
+  }
+
   /** Appends the member's message to their open session (creating it). Retried ids are not duplicated. */
-  async appendUserMessage(userId: string, id: string, content: string): Promise<StoredSession> {
+  async appendUserMessage(userId: string, id: string, content: string, flags: GuardFlag[] = []): Promise<StoredSession> {
     const owner = new Types.ObjectId(userId);
     const now = new Date();
-    const message: StoredMessage = { id, role: 'user', by: 'user', content, at: now };
+    const message: StoredMessage = { id, role: 'user', by: 'user', content, at: now, ...(flags.length ? { flags } : {}) };
+    const flagged = flagUpdate(flags, now);
     for (let attempt = 0; ; attempt++) {
       try {
         const session = await this.sessions.findOneAndUpdate(
           { userId: owner, open: true, 'messages.id': { $ne: id } },
           {
             $push: { messages: { $each: [message], $slice: -MAX_STORED_MESSAGES } },
-            $set: { updatedAt: now },
+            $set: { updatedAt: now, ...flagged.set },
+            ...flagged.addToSet,
             $setOnInsert: { mode: 'ai' as SessionMode, createdAt: now },
           },
           { upsert: true, returnDocument: 'after' },
@@ -113,22 +154,30 @@ export class GodChatSessionsService implements OnModuleInit {
     }
   }
 
-  /** Stores the AI reply unless an admin took the session over while the model was thinking. */
-  async appendAiReply(sessionId: Types.ObjectId, content: string) {
+  /**
+   * Stores the AI's answer to member message `replyTo`, unless an admin took the session over
+   * while the model was thinking or another request already answered that message.
+   */
+  async appendAiReply(sessionId: Types.ObjectId, content: string, replyTo: string, flags: GuardFlag[] = []) {
     const now = new Date();
+    const flagged = flagUpdate(flags, now);
+    const reply: StoredMessage = {
+      id: new Types.ObjectId().toHexString(), role: 'assistant', by: 'ai', content, at: now,
+      ...(flags.length ? { flags } : {}),
+    };
     await this.sessions.updateOne(
-      { _id: sessionId, open: true, mode: 'ai' },
+      { _id: sessionId, open: true, mode: 'ai', answeredThrough: { $ne: replyTo } },
       {
-        $push: {
-          messages: {
-            $each: [{ id: new Types.ObjectId().toHexString(), role: 'assistant', by: 'ai', content, at: now }],
-            $slice: -MAX_STORED_MESSAGES,
-          },
-        },
-        $set: { updatedAt: now },
+        $push: { messages: { $each: [reply], $slice: -MAX_STORED_MESSAGES } },
+        $set: { updatedAt: now, answeredThrough: replyTo, ...flagged.set },
+        ...flagged.addToSet,
       },
     );
     return this.sessions.findOne({ _id: sessionId });
+  }
+
+  async saveSummary(sessionId: Types.ObjectId, summary: SessionSummary) {
+    await this.sessions.updateOne({ _id: sessionId }, { $set: { summary } });
   }
 
   async closeOpen(userId: string) {
@@ -139,12 +188,52 @@ export class GodChatSessionsService implements OnModuleInit {
     );
   }
 
+  /** The member's earlier, closed chats, newest first. */
+  async history(userId: string, input: z.infer<typeof historyInput>) {
+    const filter: Record<string, unknown> = { userId: new Types.ObjectId(userId), open: false };
+    if (input.before) filter.updatedAt = { $lt: new Date(input.before) };
+    const rows = await this.sessions
+      .aggregate<any>([
+        { $match: filter },
+        { $sort: { updatedAt: -1 } },
+        { $limit: PAGE },
+        {
+          $project: {
+            createdAt: 1, updatedAt: 1, closedAt: 1,
+            messageCount: { $size: { $filter: { input: '$messages', cond: { $ne: ['$$this.role', 'event'] } } } },
+            first: { $first: { $filter: { input: '$messages', cond: { $eq: ['$$this.role', 'user'] } } } },
+          },
+        },
+      ])
+      .toArray();
+    const sessions = rows.map((row) => ({
+      id: String(row._id),
+      createdAt: row.createdAt,
+      updatedAt: row.updatedAt,
+      closedAt: row.closedAt ?? null,
+      messageCount: row.messageCount,
+      preview: String(row.first?.content ?? '').slice(0, PREVIEW_CHARS),
+    }));
+    return { sessions, next: rows.length === PAGE ? rows[rows.length - 1]!.updatedAt : null };
+  }
+
+  /** One of the member's own sessions; another member's id reads as missing. */
+  async ownSession(userId: string, id: string) {
+    const session = await this.sessions.findOne({ _id: toId(id), userId: new Types.ObjectId(userId) });
+    if (!session) throw new NotFoundException('Session not found');
+    return session;
+  }
+
   // ---- admin side --------------------------------------------------------
 
   async list(input: z.infer<typeof sessionListInput>) {
-    const filter: Record<string, unknown> = { open: true };
+    const filter: Record<string, unknown> = {};
+    if (['open', 'live', 'staff'].includes(input.filter)) filter.open = true;
+    if (input.filter === 'ended') filter.open = false;
+    if (input.filter === 'flagged') filter.flagged = true;
     if (input.filter === 'live') filter.updatedAt = { $gte: new Date(Date.now() - LIVE_WINDOW_MS) };
     if (input.filter === 'staff') filter.mode = 'staff';
+    if (input.userId) filter.userId = new Types.ObjectId(input.userId);
     if (input.before)
       filter.updatedAt = { ...((filter.updatedAt as object) ?? {}), $lt: new Date(input.before) };
     const rows = await this.sessions
@@ -156,7 +245,7 @@ export class GodChatSessionsService implements OnModuleInit {
         { $lookup: { from: 'Users', localField: 'staffId', foreignField: '_id', as: 'staff', pipeline: [{ $project: USER_FIELDS }] } },
         {
           $project: {
-            mode: 1, updatedAt: 1, createdAt: 1, takenOverAt: 1,
+            mode: 1, open: 1, updatedAt: 1, createdAt: 1, closedAt: 1, takenOverAt: 1, flags: 1, flagged: 1,
             user: { $first: '$user' },
             staff: { $first: '$staff' },
             messageCount: { $size: '$messages' },
@@ -165,7 +254,7 @@ export class GodChatSessionsService implements OnModuleInit {
         },
       ])
       .toArray();
-    const sessions = rows.map((row) => ({ ...row, live: Date.now() - new Date(row.updatedAt).getTime() < LIVE_WINDOW_MS }));
+    const sessions = rows.map((row) => ({ ...row, live: isLive(row) }));
     return { sessions, next: rows.length === PAGE ? rows[rows.length - 1]!.updatedAt : null };
   }
 
@@ -179,7 +268,7 @@ export class GodChatSessionsService implements OnModuleInit {
       ])
       .toArray();
     if (!row) throw new NotFoundException('Session not found');
-    return { ...row, live: Date.now() - new Date(row.updatedAt).getTime() < LIVE_WINDOW_MS };
+    return { ...row, live: isLive(row) };
   }
 
   /** Any admin may take over at any time, including from another admin. */
@@ -207,7 +296,7 @@ export class GodChatSessionsService implements OnModuleInit {
       {
         $set: { mode: 'ai', updatedAt: now },
         $unset: { staffId: '', takenOverAt: '' },
-        $push: { messages: { $each: [this.event('The team member has left. God (AI) is answering again.', now)], $slice: -MAX_STORED_MESSAGES } },
+        $push: { messages: { $each: [this.event('The team member has left. God (AI) is answering again and remembers this chat.', now)], $slice: -MAX_STORED_MESSAGES } },
       },
     );
     if (result.matchedCount) this.logger.log(`Admin ${actorId} released God chat session ${id}`);
@@ -235,6 +324,14 @@ export class GodChatSessionsService implements OnModuleInit {
       if (!session.messages.some((row) => row.id === input.id))
         throw new ConflictException('Take over this session before replying');
     }
+    return this.detail(id);
+  }
+
+  /** Takes a chat off the "Flagged" list; its flags stay on record. */
+  async markReviewed(actorId: string, id: string) {
+    const result = await this.sessions.updateOne({ _id: toId(id) }, { $set: { flagged: false } });
+    if (!result.matchedCount) throw new NotFoundException('Session not found');
+    this.logger.log(`Admin ${actorId} reviewed flagged God chat session ${id}`);
     return this.detail(id);
   }
 

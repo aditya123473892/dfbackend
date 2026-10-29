@@ -47,6 +47,20 @@ export class GodChatController {
     return successRes(await this.godChat.newSession(actor.id));
   }
 
+  /** The member's earlier, closed chats, newest first. Query: before (ISO date) for the next page. */
+  @Get('history')
+  @Header('Cache-Control', 'private, no-store')
+  async history(@AuthUser() actor: IAuthUser, @Query() query: Record<string, unknown>) {
+    return successGetRes(await this.godChat.history(actor.id, query));
+  }
+
+  /** One of the member's own chats, read-only once closed. */
+  @Get('history/:id')
+  @Header('Cache-Control', 'private, no-store')
+  async pastSession(@AuthUser() actor: IAuthUser, @Param('id') id: string) {
+    return successGetRes(await this.godChat.pastSession(actor.id, id));
+  }
+
   /** Legacy stateless form. Body: { messages: [{ role: 'user' | 'assistant', content }] }, newest last. */
   @Post()
   @Header('Cache-Control', 'private, no-store')
@@ -62,7 +76,10 @@ export class GodChatController {
 @UseGuards(JwtAuthGuard, RolesGuard)
 @Roles(ERole.ADMIN)
 export class AdminGodChatController {
-  constructor(private readonly sessions: GodChatSessionsService) {}
+  constructor(
+    private readonly sessions: GodChatSessionsService,
+    private readonly godChat: GodChatService,
+  ) {}
 
   @Get('sessions')
   @Header('Cache-Control', 'private, no-store')
@@ -81,9 +98,16 @@ export class AdminGodChatController {
     return successRes(await this.sessions.takeOver(actor.id, id));
   }
 
+  /** The AI picks the chat back up with its full context and answers anything left waiting. */
   @Post('sessions/:id/release')
   async release(@AuthUser() actor: IAuthUser, @Param('id') id: string) {
-    return successRes(await this.sessions.release(actor.id, id));
+    return successRes(await this.godChat.release(actor.id, id));
+  }
+
+  /** Removes a chat from the "flagged" list once someone has looked at it. */
+  @Post('sessions/:id/reviewed')
+  async reviewed(@AuthUser() actor: IAuthUser, @Param('id') id: string) {
+    return successRes(await this.sessions.markReviewed(actor.id, id));
   }
 
   @Post('sessions/:id/messages')

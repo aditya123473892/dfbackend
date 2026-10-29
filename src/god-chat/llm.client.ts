@@ -2,6 +2,7 @@ import { Injectable, Logger, ServiceUnavailableException } from '@nestjs/common'
 import { ConfigService } from '@nestjs/config';
 
 export type LlmMessage = { role: 'system' | 'user' | 'assistant'; content: string };
+export type LlmOptions = { temperature?: number; maxTokens?: number };
 
 const DEFAULT_BASE_URL = 'https://api.deepseek.com';
 const DEFAULT_MODEL = 'deepseek-chat';
@@ -20,7 +21,7 @@ export class LlmClient {
     return Boolean(this.config.get<string>('DEEPSEEK_API_KEY')?.trim());
   }
 
-  async complete(messages: LlmMessage[]): Promise<string> {
+  async complete(messages: LlmMessage[], options: LlmOptions = {}): Promise<string> {
     const apiKey = this.config.get<string>('DEEPSEEK_API_KEY')?.trim();
     if (!apiKey) throw new ServiceUnavailableException('Chat with God is not configured');
     const baseUrl = (this.config.get<string>('DEEPSEEK_BASE_URL')?.trim() || DEFAULT_BASE_URL).replace(/\/$/, '');
@@ -31,7 +32,13 @@ export class LlmClient {
       response = await fetch(`${baseUrl}/chat/completions`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${apiKey}` },
-        body: JSON.stringify({ model, messages, temperature: 0.7, max_tokens: 600, stream: false }),
+        body: JSON.stringify({
+          model,
+          messages,
+          temperature: options.temperature ?? 0.7,
+          max_tokens: options.maxTokens ?? 600,
+          stream: false,
+        }),
         signal: AbortSignal.timeout(TIMEOUT_MS),
       });
     } catch (error) {

@@ -72,6 +72,67 @@ describe('God chat sessions (Mongo)', () => {
     expect(back.session!.messages.filter((m) => m.role === 'event')).toHaveLength(3);
   });
 
+  it('picks up after a handoff with the team\'s replies in context and answers what was left waiting', async () => {
+    const userId = new Types.ObjectId().toHexString();
+    await chat.send(userId, { id: 'hand-0001', content: 'can I get a refund for premium?' });
+    const id = (await chat.session(userId)).session!.id;
+    await sessions.takeOver(admin.toHexString(), id);
+    await sessions.staffReply(admin.toHexString(), id, { id: 'staff-1001', content: 'I refunded you; it lands in 5 days.' });
+    await chat.send(userId, { id: 'hand-0002', content: 'great, and when does premium end?' });
+
+    complete.mockClear();
+    complete.mockResolvedValueOnce('Your premium ends when the refund lands.');
+    const released = await sessions.release(admin.toHexString(), id);
+    expect(released.mode).toBe('ai');
+    const resumed = await chat.resume(released._id);
+    expect(complete).toHaveBeenCalledTimes(1);
+    const [messages] = complete.mock.calls[0] as unknown as [{ role: string; content: string }[]];
+    expect(messages[0]!.content).toContain('HANDOFF:');
+    // God's earlier answer and the team's reply are one assistant turn, the team's part marked.
+    expect(messages.slice(1).map((m) => m.content)).toEqual([
+      'can I get a refund for premium?',
+      'Seek the Events tab.\n\n[Team member] I refunded you; it lands in 5 days.',
+      'great, and when does premium end?',
+    ]);
+    expect(resumed!.messages.at(-1)).toMatchObject({ by: 'ai', content: 'Your premium ends when the refund lands.' });
+
+    // Nothing is waiting any more, so resuming again (or a retry) does not answer twice.
+    await chat.resume(released._id);
+    await chat.send(userId, { id: 'hand-0002', content: 'great, and when does premium end?' });
+    expect(complete).toHaveBeenCalledTimes(1);
+  });
+
+  it('flags risky messages for admins, keeps closed chats as history and only shows members their own', async () => {
+    const userId = new Types.ObjectId().toHexString();
+    complete.mockClear();
+    const first = await chat.send(userId, { id: 'flag-0001', content: 'my password is hunter22 and I feel suicidal' });
+    expect(complete).not.toHaveBeenCalled();
+    expect(first.session!.messages.map((m) => m.content)).toEqual([
+      'my password is [removed] and I feel suicidal',
+      expect.stringContaining('crisis line'),
+    ]);
+    expect(JSON.stringify(first)).not.toContain('self_harm');
+
+    const flagged = await sessions.list({ filter: 'flagged' });
+    const row = flagged.sessions.find((s) => String(s._id) === first.session!.id);
+    expect(row).toMatchObject({ flagged: true, flags: expect.arrayContaining(['self_harm', 'sensitive_data']) });
+    await sessions.markReviewed(admin.toHexString(), first.session!.id);
+    expect((await sessions.list({ filter: 'flagged' })).sessions.some((s) => String(s._id) === first.session!.id)).toBe(false);
+
+    await chat.newSession(userId);
+    await chat.send(userId, { id: 'flag-0002', content: 'how do events work' });
+    const history = await chat.history(userId, {});
+    expect(history.sessions).toHaveLength(1);
+    expect(history.sessions[0]).toMatchObject({ id: first.session!.id, messageCount: 2, preview: 'my password is [removed] and I feel suicidal' });
+    const past = await chat.pastSession(userId, first.session!.id);
+    expect(past.session).toMatchObject({ open: false, messages: [{ by: 'user' }, { by: 'ai' }] });
+    await expect(chat.pastSession(member.toHexString(), first.session!.id)).rejects.toThrow('Session not found');
+
+    const ended = await sessions.list({ filter: 'ended', userId });
+    expect(ended.sessions.map((s) => String(s._id))).toEqual([first.session!.id]);
+    expect((await sessions.list({ filter: 'all', userId })).sessions).toHaveLength(2);
+  });
+
   it('does not duplicate a retried message and starts fresh after "new chat"', async () => {
     complete.mockClear();
     const userId = new Types.ObjectId().toHexString();
