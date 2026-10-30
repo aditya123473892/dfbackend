@@ -76,6 +76,7 @@
     "sharp": "^0.34.5",
     "stripe": "^17.6.0",
     "twilio": "^5.13.1",
+    "undici": "^6.29.1",
     "zod": "4.1.12"
   },
   "devDependencies": {

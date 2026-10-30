@@ -1,5 +1,5 @@
 import { ApiProperty, OmitType } from '@nestjs/swagger';
-import { IsIn, IsNotEmpty, IsOptional, IsString, Matches, MaxLength } from 'class-validator';
+import { IsIn, IsNotEmpty, IsOptional, IsString, Matches, MaxLength, IsByteLength } from 'class-validator';
 import { CreateUserDto } from 'src/users/dtos';
 
 export class SendOtpDto {
@@ -35,10 +35,52 @@ export class OtpSignupDto extends OmitType(CreateUserDto, [
   'isEmailVerified',
   'passwordResetToken',
   'passwordResetTokenUsed',
+  'firstName',
+  'lastName',
+  'age',
+  'gender',
+  'password',
 ] as const) {
+  @IsString()
+  @IsByteLength(8, 72)
+  @Matches(/^(?=.*[A-Z])(?=.*[0-9])[\s\S]+$/, { message: 'Password needs an uppercase letter and a number' })
+  password: string;
+
+  @IsOptional()
+  @IsString()
+  @MaxLength(50)
+  firstName?: string;
+
+  @IsOptional()
+  @IsString()
+  @MaxLength(50)
+  lastName?: string;
+
+  @IsOptional()
+  age?: number;
+
+  @IsOptional()
+  @IsString()
+  @MaxLength(50)
+  gender?: string;
+
   @ApiProperty({ description: 'From POST /auth/otp/signup/verify' })
   @IsString()
   @IsNotEmpty()
   @MaxLength(2048)
   signupToken: string;
+}
+
+export class PasswordLoginDto {
+  @ApiProperty({ description: 'Email or mobile number with country code' })
+  @IsString()
+  @IsNotEmpty()
+  @MaxLength(254)
+  identifier: string;
+
+  @ApiProperty()
+  @IsString()
+  @IsNotEmpty()
+  @MaxLength(256)
+  password: string;
 }

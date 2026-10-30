@@ -24,10 +24,9 @@ export class JwtStrategy extends PassportStrategy(Strategy) {
 
   async validate(req, payload) {
     if (!Types.ObjectId.isValid(payload.sub)) throw new UnauthorizedException();
-    // Mobile = phone OTP only. Password sessions (web, or issued before OTP) are
-    // rejected so the app signs out and returns to phone sign-in.
-    if (isMobileClient(req) && payload.auth_method !== 'otp')
-      throw new UnauthorizedException('Phone sign-in required');
+    // Only session tokens are accepted; signup/bootstrap proofs cannot authenticate.
+    if (isMobileClient(req) && !['otp', 'password'].includes(payload.auth_method))
+      throw new UnauthorizedException('Sign-in required');
     const user = await this.db.db
       .collection('Users')
       .findOne({

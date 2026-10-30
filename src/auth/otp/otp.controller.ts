@@ -5,7 +5,7 @@ import { AuthUser } from 'src/common/decorators';
 import { IAuthUser } from 'src/common/interfaces';
 import { successRes } from 'src/common/interceptors';
 import { LoginDto } from '../dtos';
-import { OtpSignupDto, PhoneDto, SendOtpDto, VerifyOtpDto } from './otp.dto';
+import { OtpSignupDto, PasswordLoginDto, PhoneDto, SendOtpDto, VerifyOtpDto } from './otp.dto';
 import { OtpService } from './otp.service';
 import { PhoneLinkGuard } from './phone-link.guard';
 
@@ -15,6 +15,11 @@ const clientIp = (req: Request) => req.ip || req.socket?.remoteAddress || 'unkno
 @Controller('auth')
 export class OtpController {
   constructor(private readonly otp: OtpService) {}
+
+  @Post('password/login')
+  async passwordLogin(@Body() dto: PasswordLoginDto, @Req() req: Request) {
+    return successRes(await this.otp.passwordLogin(dto.identifier, dto.password, clientIp(req)));
+  }
 
   /** Generic response: never reveals whether the number belongs to an account. */
   @Post('otp/send')

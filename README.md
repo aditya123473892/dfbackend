@@ -73,8 +73,14 @@ hostname directly. Start the backend after MongoDB has elected its primary.
 
 ## Phone OTP sign-in (Twilio Verify)
 
-The mobile app signs in with a phone number and SMS code only. The web app's
-email/password login is unchanged. Code lives in `src/auth/otp/`.
+The mobile app offers phone/SMS OTP login and email-or-phone/password login.
+Signup verifies the phone first, then requires email and a password (8–72 bytes,
+at least one uppercase letter and one number). Profile fields are optional.
+`POST /auth/password/login` takes `{ identifier, password }`, accepts email or a
+verified phone number, and returns `{ user, accessToken }`. Attempts are capped per
+IP and identifier. These tokens carry `auth_method: "password"`; OTP tokens retain
+`auth_method: "otp"`. The web app's email/password login is unchanged.
+Code lives in `src/auth/otp/`.
 
 ### 1. Create the Verify Service
 
@@ -119,7 +125,8 @@ npm run otp:indexes -- --apply    # unique partial index Users.phoneE164 + TTL i
 | `POST /auth/otp/send` `{ phone, purpose?: "login" \| "signup" }` | none | Login: an SMS is sent only if the number belongs to an account, but the response is identical either way. |
 | `POST /auth/otp/verify` `{ phone, code }` | none | Returns `{ user, accessToken }` like `/auth/login`. The token has `auth_method: "otp"`. |
 | `POST /auth/otp/signup/verify` `{ phone, code }` | none | Returns a 30-minute `signupToken`. |
-| `POST /auth/otp/signup` `{ signupToken, username, password, firstName, lastName, age, gender }` | none | Creates the account with the verified phone. |
+| `POST /auth/otp/signup` `{ signupToken, username, password }` | none | Creates the account with the verified phone; `username` is email, profile fields are optional. |
+| `POST /auth/password/login` `{ identifier, password }` | none | Email or verified phone password login. |
 | `POST /auth/phone/bootstrap` `{ username, password }` | none | Existing users without a phone: returns a 15-minute `bootstrapToken` that only works on the two routes below. |
 | `POST /auth/phone/send` `{ phone }`, `POST /auth/phone/verify` `{ phone, code }` | session or bootstrap token | Adds or changes the phone after a fresh OTP. A bootstrap token ends with a phone session. |
 
@@ -127,15 +134,16 @@ Errors return `{ statusCode, error, message }`. `error` is stable: `PHONE_INVALI
 `OTP_INVALID`, `OTP_EXPIRED`, `OTP_COOLDOWN`, `OTP_RATE_LIMITED`, `OTP_SEND_LIMIT`, `OTP_CHECK_LIMIT`,
 `PHONE_IN_USE`, `PHONE_ALREADY_LINKED`, `PHONE_LOGIN_REQUIRED`, `SIGNUP_SESSION_INVALID`, `OTP_UNAVAILABLE`.
 
-### How "mobile = OTP only" is enforced
+### Mobile session methods
 
 - The Expo app sends `X-Client-Platform: mobile` on every request. Browsers cannot send it, because CORS does not allow the header.
 - With that header, `POST /auth/login` and `POST /auth/signup` return 403 `PHONE_LOGIN_REQUIRED`, and
-  `JwtStrategy` rejects any token whose `auth_method` is not `otp`. Old password sessions are signed out.
+  Mobile password login uses `/auth/password/login` instead. `JwtStrategy` accepts
+  explicitly marked `otp` and `password` sessions. Unmarked legacy mobile sessions are rejected.
 - Signup and bootstrap tokens are signed with a key derived from `JWT_SECRET`. They are never valid as sessions, including on the chat socket.
 - **Spoofing limit:** the header is a client claim. A modified client can omit it and use the web
-  login, which is still allowed. What the server guarantees is that sessions used by the real app are OTP sessions,
-  and that routes marked `OtpSessionGuard` (the vault, with `MOBILE_OTP_ONLY_ROUTES=on`) reject web sessions.
+  login, which is still allowed. Routes marked `OtpSessionGuard` (the vault, with
+  `MOBILE_OTP_ONLY_ROUTES=on`) still require an OTP session and reject password sessions.
   Stronger binding needs app attestation (Play Integrity / App Attest).
 
 ### Manual test with a Twilio trial account

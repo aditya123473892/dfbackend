@@ -9,6 +9,7 @@ import { maskPhone, normalizePhone, throttleKey } from './phone';
 import { ONE_DAY, OtpThrottle, TEN_MINUTES } from './otp-throttle';
 import { BOOTSTRAP_TOKEN_SECONDS, ScopedTokens, SIGNUP_TOKEN_SECONDS } from './scoped-token';
 import { TwilioVerifyClient } from './twilio-verify.client';
+import { randomUUID } from 'node:crypto';
 
 // Same wording as POST /auth/login so existing clients map them identically.
 const UNVERIFIED_EMAIL = "Your account isn't verified yet, Please check your email.";
@@ -66,6 +67,7 @@ export class OtpService {
     const claims = await this.tokens.verify(dto.signupToken, 'phone_signup');
     if (!claims) throw otpError('SIGNUP_SESSION_INVALID');
     const phone = claims.phone;
+    dto.username = dto.username.trim().toLowerCase();
     if (await this.users.findByUsername(dto.username))
       throw new HttpException(
         { statusCode: HttpStatus.BAD_REQUEST, error: 'EMAIL_IN_USE', message: 'Account already exists with this email!, go to login' },
@@ -87,16 +89,18 @@ export class OtpService {
         isEmailVerified: false,
         passwordResetToken: undefined,
         passwordResetTokenUsed: false,
-        displayname: dto.username.split('@')[0],
+        displayname: `member_${randomUUID().replace(/-/g, '').slice(0, 16)}`,
         phoneE164: phone,
         phoneVerifiedAt: new Date(),
       } as any);
     } catch (error) {
       if (error?.code === 11000 && error?.keyPattern?.phoneE164) throw otpError('PHONE_IN_USE');
+      if (error?.code === 11000 && error?.keyPattern?.username)
+        throw new HttpException({ error: 'EMAIL_IN_USE', message: 'An account with this email already exists' }, HttpStatus.CONFLICT);
       throw error;
     }
 
-    const sent = await this.mail.verifyAccount(user.username, user.firstName);
+    const sent = await this.mail.verifyAccount(user.username, user.firstName || 'Member');
     // Same development behaviour as /auth/signup: no SES, no verification email.
     if (!process.env.AWS_ACCESS_KEY || !process.env.AWS_SECRET || !process.env.AWS_SES_REGION)
       await this.users.updateOne(user._id.toString(), { isEmailVerified: true });
@@ -111,6 +115,29 @@ export class OtpService {
           : 'Account created, but the verification email could not be sent. Contact support.',
       };
     return { emailVerificationRequired: false, ...(await this.signIn(created)) };
+  }
+
+  /** Password sessions remain distinct from OTP sessions for sensitive route guards. */
+  async passwordLogin(identifier: string, password: string, ip: string) {
+    const input = identifier.trim();
+    const phone = input.includes('@') ? null : normalizePhone(input);
+    const key = phone || input.toLowerCase();
+    await this.throttle.consume([
+      { key: throttleKey('password-login-ip', ip), limit: this.throttle.limits.passwordPerIp10m, windowSeconds: TEN_MINUTES },
+      { key: throttleKey('password-login-user', key), limit: 10, windowSeconds: TEN_MINUTES },
+    ]);
+    const owner = phone ? await this.users.findByVerifiedPhone(phone) : null;
+    if (!input.includes('@') && !owner) throw new UnauthorizedException('Invalid username or password');
+    const username = owner?.username || input.toLowerCase();
+    await this.auth.validateUser(username, password);
+    // Password lookup intentionally projects out profile fields, including email
+    // verification. Read the full account before evaluating sign-in eligibility.
+    const user = await this.users.findByUsername(username);
+    if (!user) throw new UnauthorizedException('Invalid username or password');
+    this.assertCanSignIn(user);
+    const { accessToken } = await this.auth.createTokens(user, 'password');
+    await this.users.updateLoginInfo(String(user._id));
+    return { user, accessToken };
   }
 
   /** One-time password sign-in for existing users who have no verified phone yet. */

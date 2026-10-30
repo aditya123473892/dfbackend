@@ -3,6 +3,7 @@ import { BadRequestException, HttpException, ServiceUnavailableException } from 
 import { CONTEXT_MESSAGES, GodChatService, KEEP_VERBATIM, MAX_CHARS, MAX_TURNS, selectKnowledge, TEAM_MARK } from './god-chat.service';
 import { FALLBACK_REPLY, INJECTION_REPLY, SELF_HARM_REPLY } from './guardrails';
 import { LlmClient } from './llm.client';
+import * as undici from 'undici';
 import { GodChatSessionsService } from './god-chat-sessions.service';
 
 const config = (values: Record<string, string> = {}): any => ({ get: (key: string) => values[key] });
@@ -70,11 +71,33 @@ describe('Chat with God', () => {
   });
 
   it('maps provider failures to 503 without leaking details', async () => {
-    const fetchMock = jest.spyOn(global, 'fetch').mockResolvedValue(new Response('{"error":"bad key"}', { status: 401 }));
+    const fetchMock = jest.spyOn(undici, 'fetch').mockResolvedValue(new undici.Response('{"error":"bad key"}', { status: 401 }));
     const llm = new LlmClient(config({ DEEPSEEK_API_KEY: 'test-key' }));
     await expect(llm.complete([{ role: 'user', content: 'hi' }])).rejects.toBeInstanceOf(ServiceUnavailableException);
     expect(fetchMock.mock.calls[0]![0]).toBe('https://api.deepseek.com/chat/completions');
     fetchMock.mockRestore();
+  });
+
+  it('uses the configured model, token budget and request timeout', async () => {
+    const fetchMock = jest.spyOn(undici, 'fetch').mockResolvedValue(new undici.Response(
+      JSON.stringify({ choices: [{ message: { content: '  OK  ' } }] }),
+    ));
+    const timeout = jest.spyOn(AbortSignal, 'timeout');
+    try {
+      const llm = new LlmClient(config({
+        DEEPSEEK_API_KEY: 'test-key', DEEPSEEK_MODEL: 'deepseek-v4-flash',
+        DEEPSEEK_MAX_TOKENS: '2048', DEEPSEEK_REQUEST_TIMEOUT_SECONDS: '120',
+        DEEPSEEK_CONNECT_TIMEOUT_SECONDS: '10', DEEPSEEK_BASE_URL: 'https://api.deepseek.com/',
+      }));
+      await expect(llm.complete([{ role: 'user', content: 'hi' }])).resolves.toBe('OK');
+      expect(timeout).toHaveBeenCalledWith(120_000);
+      expect(JSON.parse(fetchMock.mock.calls[0]![1]!.body as string)).toMatchObject({
+        model: 'deepseek-v4-flash', max_tokens: 2048, thinking: { type: 'disabled' },
+      });
+    } finally {
+      fetchMock.mockRestore();
+      timeout.mockRestore();
+    }
   });
 
   describe('stored sessions', () => {

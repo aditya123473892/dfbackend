@@ -21,10 +21,10 @@ export class Users {
   @Prop({ required: true, unique: true })
   displayname: string;
 
-  @Prop({ required: true })
+  @Prop({ required: false, default: '' })
   firstName: string;
 
-  @Prop({ required: true })
+  @Prop({ required: false, default: '' })
   lastName: string;
 
   // Legacy free-text value from web signup; never verified or unique.

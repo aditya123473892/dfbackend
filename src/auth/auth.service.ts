@@ -45,7 +45,7 @@ export class AuthService {
       user: user.username,
       sub: user._id,
       roles: user.roles,
-      // Mobile requests accept only 'otp' sessions (see JwtStrategy).
+      // Preserve the method so sensitive routes can require a fresh OTP session.
       auth_method: authMethod,
     };
     const staff = user.roles?.some((role) => ['moderator', 'admin', 'root'].includes(role));

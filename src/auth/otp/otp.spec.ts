@@ -61,7 +61,11 @@ describe('Phone OTP authentication', () => {
     // A fresh document per read, as from MongoDB (validateUser blanks its password).
     findOneWithPassword: async (username: string) => {
       const row = users.find((candidate) => candidate.username === username);
-      return row ? { ...row } : null;
+      return row ? {
+        _id: row._id, username: row.username, password: row.password, roles: row.roles,
+        isBlocked: row.isBlocked, moderationSuspendedUntil: row.moderationSuspendedUntil,
+        deletionRequestedAt: row.deletionRequestedAt,
+      } : null;
     },
     findByVerifiedPhone: async (phone: string) =>
       users.find((row) => row.phoneE164 === phone && row.phoneVerifiedAt) ?? null,
@@ -287,7 +291,36 @@ describe('Phone OTP authentication', () => {
     });
   });
 
-  describe('mobile = phone OTP only', () => {
+  describe('mobile authentication', () => {
+    const passwordLogin = (identifier: string, password = 'Correct1pass') =>
+      request(app.getHttpServer()).post('/auth/password/login').set(MOBILE).send({ identifier, password });
+
+    it('signs in with email or verified phone and marks password sessions accurately', async () => {
+      const owner = user({ username: 'member@example.test', phoneE164: PHONE, phoneVerifiedAt: new Date() });
+      for (const identifier of [' MEMBER@EXAMPLE.TEST ', PHONE, '98765 43210']) {
+        const res = await passwordLogin(identifier).expect(201);
+        expect(claims(res.body.data.accessToken)).toMatchObject({ sub: String(owner._id), auth_method: 'password' });
+        await request(app.getHttpServer()).get('/auth/me').set(MOBILE)
+          .set('Authorization', `Bearer ${res.body.data.accessToken}`).expect(200);
+      }
+    });
+
+    it('rejects wrong passwords, unknown identities, blocked and deleted users', async () => {
+      const owner = user({ username: 'member@example.test', phoneE164: PHONE, phoneVerifiedAt: new Date() });
+      await passwordLogin(owner.username, 'wrong').expect(401);
+      await passwordLogin('unknown@example.test').expect(401);
+      await passwordLogin(OTHER_PHONE).expect(401);
+      owner.isBlocked = true;
+      await passwordLogin(owner.username).expect(401);
+      owner.isBlocked = false;
+      owner.deletionRequestedAt = new Date();
+      await passwordLogin(PHONE).expect(401);
+    });
+
+    it('rate limits repeated password attempts', async () => {
+      for (let i = 0; i < 10; i++) await passwordLogin('unknown@example.test', 'wrong').expect(401);
+      await passwordLogin('unknown@example.test', 'wrong').expect(429);
+    });
     it('rejects password login and password signup from the mobile app', async () => {
       const owner = user({});
       const login = await request(app.getHttpServer())
@@ -309,12 +342,12 @@ describe('Phone OTP authentication', () => {
         .get('/auth/me').set('Authorization', `Bearer ${res.body.data.accessToken}`).expect(200);
     });
 
-    it('rejects password sessions on mobile requests and accepts OTP sessions', async () => {
+    it('accepts password and OTP sessions on mobile but rejects legacy unmarked tokens', async () => {
       const owner = user({ phoneE164: PHONE, phoneVerifiedAt: new Date() });
       const web = await new AuthService(usersService as any, jwt).createTokens(owner);
       const legacy = jwt.sign({ sub: String(owner._id), roles: owner.roles }); // issued before OTP
-      for (const token of [web.accessToken, legacy])
-        await request(app.getHttpServer()).get('/auth/me').set(MOBILE).set('Authorization', `Bearer ${token}`).expect(401);
+      await request(app.getHttpServer()).get('/auth/me').set(MOBILE).set('Authorization', `Bearer ${legacy}`).expect(401);
+      await request(app.getHttpServer()).get('/auth/me').set(MOBILE).set('Authorization', `Bearer ${web.accessToken}`).expect(200);
       const otp = (await verify({ phone: PHONE, code: '123456' })).body.data.accessToken;
       await request(app.getHttpServer()).get('/auth/me').set(MOBILE).set('Authorization', `Bearer ${otp}`).expect(200);
     });
@@ -401,6 +434,21 @@ describe('Phone OTP authentication', () => {
 
   describe('new signup', () => {
     const profile = { username: 'new@example.test', password: 'Correct1pass', firstName: 'New', lastName: 'User', age: 30, gender: 'female' };
+
+    it('creates an account with only email, password and a verified phone proof', async () => {
+      const proof = await request(app.getHttpServer()).post('/auth/otp/signup/verify')
+        .send({ phone: PHONE, code: '123456' }).expect(201);
+      const signupToken = proof.body.data.signupToken;
+      await request(app.getHttpServer()).post('/auth/otp/signup')
+        .send({ username: 'MINIMAL@example.test', password: 'weak', signupToken }).expect(400);
+      const created = await request(app.getHttpServer()).post('/auth/otp/signup')
+        .send({ username: 'MINIMAL@example.test', password: 'Correct1pass', signupToken }).expect(201);
+      expect(created.body.data.user.username).toBe('minimal@example.test');
+      expect(created.body.data.user.phoneE164).toBe(PHONE);
+      expect(created.body.data.user.displayname).toMatch(/^member_/);
+      await request(app.getHttpServer()).post('/auth/otp/signup')
+        .send({ username: 'other@example.test', password: 'Correct1pass', signupToken }).expect(409);
+    });
 
     it('verifies the phone, then creates the account with it', async () => {
       await send({ phone: PHONE, purpose: 'signup' }).expect(201);
