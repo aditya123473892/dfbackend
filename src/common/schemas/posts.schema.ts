@@ -69,3 +69,5 @@ export const PostsSchema = SchemaFactory.createForClass(Posts);
 
 PostsSchema.index({ visibility: 1, status: 1, createdAt: -1 });
 PostsSchema.index({ user: 1, createdAt: -1 });
+PostsSchema.index({ visibility: 1, status: 1, user: 1, createdAt: -1, _id: -1 });
+PostsSchema.index({ visibility: 1, status: 1, createdAt: -1, _id: -1 });

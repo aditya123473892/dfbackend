@@ -23,6 +23,8 @@ import { EventMembersService } from '../event-members/event-members.service';
 import { groupServiceFor } from './block.fixture';
 import { NotificationService } from '../notification/notification.service';
 import { PhotosService } from '../photos/photos.service';
+import { VideosService } from '../photos/videos.service';
+import { AdminMediaService } from '../posts/admin-posts/admin-media.service';
 import { PhotoResponseInterceptor } from '../photos/response.interceptor';
 import { S3BucketService } from '../s3-bucket/s3-bucket.service';
 import { MailService } from '../mail/mail.service';
@@ -142,6 +144,8 @@ integration('Phase 1 surface verification', () => {
         ChatsController,
       ],
       providers: [
+        { provide: VideosService, useValue: {} },
+        { provide: AdminMediaService, useValue: {} },
         RolesGuard,
         {
           provide: JwtStrategy,
@@ -392,6 +396,8 @@ integration('Phase 1 surface verification', () => {
             (row) => row.likeCount === 2 && row.commentCount === 2,
           ),
         ).toBe(true);
+        const summary = await posts().findAllPublic({ summary: 'true' } as any, String(viewer));
+        expect(summary.posts.every(row => row.likeCount === 2 && row.commentCount === 2)).toBe(true);
         const comments = await posts().listComments(
           String(postIds.get(String(c))),
           String(viewer),

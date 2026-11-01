@@ -4,6 +4,11 @@ import { FindQueryDto } from '../../common/dtos/utils.dto';
 import { EPostStatus, EPostVisibility } from 'src/common/enums/posts.enum';
 
 export class FilterPostDto extends FindQueryDto {
+  @IsOptional()
+  cursor?: string;
+  @IsOptional()
+  summary?: string;
+
   @ApiProperty({ required: false })
   @IsOptional()
   user?: string;

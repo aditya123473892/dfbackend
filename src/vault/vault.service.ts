@@ -32,6 +32,7 @@ export class VaultService implements OnModuleInit {
     return { id: row.id, s3Key: row.deletedAt || row.state !== 'approved' ? null : storedKey(row) ?? null, sha256: row.sha256 ?? '', size: row.size ?? 0,
       status: row.state === 'rejected' ? 'rejected' : row.state === 'approved' ? 'approved' : 'local', hidden: row.hidden ? 1 : 0,
       sortOrder: row.order ?? 0, createdAt: row.createdAt, updatedAt: row.updatedAt, deletedAt: row.deletedAt ?? null,
+      remoteEncrypted: row.remoteEncrypted === true,
       kind: row.kind === 'video' ? 'video' : 'photo' };
   }
   async issue(owner: string, upload: UploadInput) {
@@ -114,7 +115,8 @@ export class VaultService implements OnModuleInit {
       await this.photos.assertActiveAccount(owner);
       if (await this.tombstones.findOne({ owner, id })) throw new ConflictException('Photo was deleted');
       await this.storage.putApproved(key, clean);
-      const fields = { state: 'approved', status: 'approved', ownerId: owner, resourceType: 'vault', resourceId: row.serverPhotoId || id, storageLayoutVersion: row.storageLayoutVersion || 1, contentType: 'image/jpeg', key, s3Key: key, size: clean.length, sha256: createHash('sha256').update(clean).digest('hex') };
+      await this.storage.verifyEncryptedBackup(key, clean.length);
+      const fields = { remoteEncrypted: true, state: 'approved', status: 'approved', ownerId: owner, resourceType: 'vault', resourceId: row.serverPhotoId || id, storageLayoutVersion: row.storageLayoutVersion || 1, contentType: 'image/jpeg', key, s3Key: key, size: clean.length, sha256: createHash('sha256').update(clean).digest('hex') };
       const commit = await this.rows.updateOne({ _id: row._id, state: 'processing', token }, { $set: fields, $unset: { token: '', leaseUntil: '', processingKey: '' } });
       if (!commit.modifiedCount) throw new ConflictException('Photo changed');
       await this.photos.enqueue([row.tempKey], new Date(row.expiresAt.getTime() + 60000));

@@ -184,12 +184,12 @@ export class PostsController {
       status: EPostStatus.APPROVED,
     };
 
-    const { posts, count } = await this.postsService.findAllPublic(
+    const { posts, count, nextCursor } = await this.postsService.findAllPublic(
       options,
       user.id,
     );
 
-    return successRes({ posts, count });
+    return successRes({ posts, count, nextCursor });
   }
 
   @ApiBearerAuth()
@@ -245,7 +245,7 @@ export class PostsController {
     const videos = dto.videoIds
       ? await this.videos.bind(actor.id, dto.videoIds, `post:${id}`)
       : undefined;
-    if (!media?.length && !(videos ?? (post as any).videos ?? []).length)
+    if ((dto.photoIds || dto.videoIds) && !media?.length && !(videos ?? (post as any).videos ?? []).length)
       throw new BadRequestException('A post needs at least one photo or video');
     const patch: any = {};
     if (dto.photoIds) patch.media = media;

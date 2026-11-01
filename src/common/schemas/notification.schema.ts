@@ -9,6 +9,11 @@ export type NotificationDocument = Notification & Document;
 
 @Schema({ timestamps: true, collection: 'Notifications' })
 export class Notification {
+  @Prop({ type: String })
+  dedupeKey?: string;
+
+  @Prop({ type: Boolean, default: false })
+  pushQueued?: boolean;
   @Prop({
     type: mongoose.Schema.Types.ObjectId,
     ref: 'Users',
@@ -40,3 +45,5 @@ export class Notification {
 export const NotificationSchema = SchemaFactory.createForClass(Notification);
 NotificationSchema.index({ receiver: 1, _id: -1 });
 NotificationSchema.index({ receiver: 1, isRead: 1 });
+NotificationSchema.index({ dedupeKey: 1 }, { unique: true, partialFilterExpression: { dedupeKey: { $type: 'string' } } });
+NotificationSchema.index({ pushQueued: 1, createdAt: 1 });

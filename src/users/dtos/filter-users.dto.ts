@@ -3,6 +3,8 @@ import { IsOptional } from 'class-validator';
 import { FindQueryDto } from '../../common/dtos/utils.dto';
 
   export class FilterUsersDto extends FindQueryDto {
+    @IsOptional()
+    summary?: string;
     @ApiProperty({ required: false })
     @IsOptional()
     username?: string;

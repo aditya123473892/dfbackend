@@ -13,6 +13,8 @@ import {
   NotFoundException,
   Put,
   Delete,
+  HttpException,
+  ServiceUnavailableException,
 } from '@nestjs/common';
 import { PhotosService } from '../photos/photos.service';
 import { SelfProfileDto } from './dtos/self-profile.dto';
@@ -47,6 +49,11 @@ import { ApproveUserRequestDto } from './dtos/approve-request.dto';
 import { FollowRequestDto } from './dtos/follow-request.dto';
 import { FollowStatus } from 'src/common/schemas/follow.schema';
 import { MailService } from 'src/mail/mail.service';
+
+function followFailure(error: unknown): never {
+  if (error instanceof HttpException) throw error;
+  throw new ServiceUnavailableException('Follow status could not be saved. Try again.');
+}
 
 @ApiBearerAuth()
 @UseGuards(JwtAuthGuard)
@@ -154,7 +161,7 @@ export class UsersController {
       ...params,
     };
 
-    const { users, count } = await this.usersService.findAll(options);
+    const { users, count } = await this.usersService.findAll(options, authUser.id);
     return successRes({ users: users.map((user) => toUserResponse(user, authUser)), count });
   }
 
@@ -417,7 +424,7 @@ export class UsersController {
       );
       return successRes({ follow }, 'Follow request sent successfully');
     } catch (error) {
-      return badRequestRes(error.message);
+      followFailure(error);
     }
   }
 
@@ -453,7 +460,7 @@ export class UsersController {
       );
       return successRes({ follow }, 'Follow request processed successfully');
     } catch (error) {
-      return badRequestRes(error.message);
+      followFailure(error);
     }
   }
 
@@ -471,7 +478,7 @@ export class UsersController {
       );
       return successRes({ unfollow }, 'Successfully unfollowed user');
     } catch (error) {
-      return badRequestRes(error.message);
+      followFailure(error);
     }
   }
 
@@ -484,18 +491,41 @@ export class UsersController {
     return successRes({ followRequests });
   }
 
+  @Get('/follow/outgoing')
+  async outgoing(@AuthUser() actor: IAuthUser) {
+    return successRes({ followRequests: await this.usersService.getOutgoingRequests(actor.id) });
+  }
+
+  @Get('/follow/counts')
+  async followCounts(@AuthUser() actor: IAuthUser) {
+    return successRes(await this.usersService.followCounts(actor.id));
+  }
+
+  @Get('/follow/relationship/:userId')
+  async relationship(@Param('userId') id: string, @AuthUser() actor: IAuthUser) {
+    return successRes({ relationship: await this.usersService.relationship(actor.id, id) });
+  }
+
+  @Delete('/follow/cancel/:followId')
+  async cancelFollow(@Param('followId') id: string, @AuthUser() actor: IAuthUser) {
+    try {
+      await this.usersService.cancelFollowRequest(actor.id, id);
+      return successRes({ cancelled: true });
+    } catch (error) { followFailure(error); }
+  }
+
   @Get('/follow/followers')
   @ApiOperation({ summary: 'Get all followers of the current user' })
   async getFollowers(@AuthUser() authUser: IAuthUser) {
     const followers = await this.usersService.getFollowers(authUser.id);
-    return successRes({ followers });
+    return successRes({ followers: followers.map(user => toUserResponse(user, authUser)) });
   }
 
   @Get('/follow/following')
   @ApiOperation({ summary: 'Get all users the current user is following' })
   async getFollowing(@AuthUser() authUser: IAuthUser) {
     const following = await this.usersService.getFollowing(authUser.id);
-    return successRes({ following });
+    return successRes({ following: following.map(user => toUserResponse(user, authUser)) });
   }
 
   @UseGuards(RolesGuard)

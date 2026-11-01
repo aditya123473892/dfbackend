@@ -1,3 +1,4 @@
+import { NotificationModule } from '../notification/notification.module';
 import { Module } from '@nestjs/common';
 import { ConfigModule, ConfigService } from '@nestjs/config';
 import { JwtModule } from '@nestjs/jwt';
@@ -21,7 +22,7 @@ import { UserBookMark, UserBookMarkSchema } from 'src/common/schemas/user-bookma
 import { ChatMessage, ChatMessageSchema } from 'src/common/schemas/chats.schema';
 
 @Module({
-  imports: [
+  imports: [NotificationModule,
     PassportModule,
     MailModule,
     PostRequest,

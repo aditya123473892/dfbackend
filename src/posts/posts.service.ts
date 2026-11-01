@@ -17,7 +17,7 @@ import { CreateCommentDto, MAX_COMMENT_LENGTH } from './dto/create-comment.dto';
 import { UpdateCommentDto } from './dto/update-comment.dto';
 import { ListCommentsDto } from './dto/list-comments.dto';
 import { createHash } from 'crypto';
-import { pairBlocked } from '../user-blocks/block-context';
+import { pairBlocked, blockedIds } from '../user-blocks/block-context';
 import { visiblePostQuery } from '../user-blocks/visible-post';
 import { preserveMutation } from '../reports/preservation';
 import { EPostStatus, EPostVisibility } from 'src/common/enums/posts.enum';
@@ -172,7 +172,7 @@ export class PostsService {
   async findAllPublic(
     params: FilterPostDto,
     authUserId: string,
-  ): Promise<{ count: number; posts: PostWithFollowStatus[] }> {
+  ): Promise<{ count: number; posts: PostWithFollowStatus[]; nextCursor?: string }> {
     const query = this.postsModel.find();
 
     if (params.visibility) {
@@ -206,29 +206,36 @@ export class PostsService {
       },
     });
 
-    // Newest first unless the caller asks otherwise; without a sort, skip/limit
-    // pages are not stable.
-    this.applyPaging(query, params);
-
-    const [posts, count] = await Promise.all([
-      query.exec(),
-      this.postsModel.countDocuments(query.getQuery()),
-    ]);
+    if (params.summary === 'true') {
+      // Keep counts from the original reference arrays, but hydrate only what a feed card displays.
+      query.populate({ path: 'likes', match: { user: authUserId }, select: 'user' });
+      query.populate({ path: 'comments', select: 'content user createdAt',
+        options: { sort: { createdAt: -1 }, limit: 3 }, populate: { path: 'user', select: AUTHOR_FIELDS } });
+    }
+    const { posts, count, nextCursor } = await this.priorityPage(query, params, authUserId);
 
     const postIds = posts.map((post) => post._id);
     const authorIds = [...new Set(posts.map((post) => idOf(post.user)).filter(Boolean))];
-    const [userBookmarks, follows] = await Promise.all([
+    const [userBookmarks, follows, likeCounts, commentCounts] = await Promise.all([
       this.PostBookMarkModel.find({
         userId: authUserId,
         postId: { $in: postIds },
         status: true,
       }).select('postId'),
       this.followModel
-        .find({ follower: authUserId, following: { $in: authorIds } })
+        .find({ follower: authUserId, following: { $in: authorIds }, status: { $in: ['pending', 'accepted'] } })
         .select('following status'),
+      params.summary === 'true' ? this.likeModel.aggregate([
+        { $match: { post: { $in: postIds } } }, { $group: { _id: '$post', count: { $sum: 1 } } },
+      ]) : [],
+      params.summary === 'true' ? this.commentModel.aggregate([
+        { $match: { post: { $in: postIds } } }, { $group: { _id: '$post', count: { $sum: 1 } } },
+      ]) : [],
     ]);
 
     const bookmarkedPostIds = new Set(userBookmarks.map((bm) => bm.postId.toString()));
+    const countsByPost = (rows: any[]) => new Map(rows.map(row => [String(row._id), row.count] as const));
+    const likes = countsByPost(likeCounts), comments = countsByPost(commentCounts);
     const followStatusByAuthor = new Map(
       follows.map((follow: any) => [
         idOf(follow.following),
@@ -239,21 +246,78 @@ export class PostsService {
     const postsWithFollowStatus = await Promise.all(
       posts.map(async (post) => ({
         ...(await this.toClientPost(post)),
-        likeCount: post.likes.length,
-        commentCount: post.comments.length,
+        likeCount: params.summary === 'true' ? likes.get(String(post._id)) || 0 : post.likes.length,
+        commentCount: params.summary === 'true' ? comments.get(String(post._id)) || 0 : post.comments.length,
         likedByMe: this.isLikedBy(post, authUserId),
         followStatus: followStatusByAuthor.get(idOf(post.user)) || 'None',
         isBookmarked: bookmarkedPostIds.has(post._id.toString()),
       })),
     );
 
-    return { posts: postsWithFollowStatus as unknown as PostWithFollowStatus[], count };
+    return { posts: postsWithFollowStatus as unknown as PostWithFollowStatus[], count, nextCursor };
+  }
+
+  /** Two indexed, bounded group queries; the cursor carries group and a stable timestamp/id tie-breaker. */
+  private async priorityPage(query: any, params: FilterPostDto, viewer: string) {
+    const follows = await this.followModel.find({ follower: viewer, status: 'accepted' }).select('following').lean();
+    const ids = follows.map(f => f.following).sort((a,b) => String(a).localeCompare(String(b)));
+    const fingerprint = createHash('sha256').update(ids.map(String).join(',')).digest('hex').slice(0,16);
+    let cursor: any = { group: 0, asOf: new Date().toISOString(), fingerprint };
+    if (params.cursor && params.cursor !== 'start') {
+      try {
+        if (params.cursor.length > 1024) throw new Error();
+        cursor = JSON.parse(Buffer.from(params.cursor, 'base64url').toString());
+        if (![0,1].includes(cursor.group) || !Number.isFinite(Date.parse(cursor.asOf)) ||
+          Date.parse(cursor.asOf) > Date.now() + 1000 || !Types.ObjectId.isValid(cursor.id) ||
+          !Number.isFinite(Date.parse(cursor.date)) || Date.parse(cursor.date) > Date.parse(cursor.asOf) ||
+          cursor.fingerprint !== fingerprint) throw new Error();
+      } catch { throw new BadRequestException('Feed changed or cursor invalid. Refresh the feed.'); }
+    }
+    const size = Math.max(1, Math.min(MAX_PAGE_SIZE, Number(params.limit) || 20));
+    // Private-account public posts are discoverable only by accepted followers or their owner.
+    const [excluded, privateUsers] = await Promise.all([
+      blockedIds(this.postsModel.db, viewer),
+      this.postsModel.db.model('Users').find({ $or: [
+        { isPrivate: true, _id: { $nin: [...ids, new Types.ObjectId(viewer)] } },
+        { isBlocked: true }, { deletionRequestedAt: { $ne: null } },
+        { moderationSuspendedUntil: { $gt: new Date() } },
+      ] }).select('_id').lean(),
+    ]);
+    query.where({ user: { $nin: [...privateUsers.map(u => u._id), ...excluded.map(id => new Types.ObjectId(id))] } });
+    query.and([{ $or: [{ createdAt: { $lte: new Date(cursor.asOf) } }, { createdAt: null }] }]);
+    const groupQuery = (group: number) => query.clone().and([{ user: group === 0 ? { $in: ids } : { $nin: ids } }]);
+    const [count, followingCount] = await Promise.all([
+      this.postsModel.countDocuments(query.getQuery()), this.postsModel.countDocuments(groupQuery(0).getQuery()),
+    ]);
+    let rows: any[] = [], groups: number[] = [];
+    let offset = params.cursor ? 0 : Math.max(0, Number(params.skip) || 0);
+    for (let group = cursor.group; group <= 1 && rows.length <= size; group++) {
+      const part = groupQuery(group);
+      if (cursor.id && group === cursor.group) part.and([cursor.legacy
+        ? { createdAt: null, _id: { $lt: new Types.ObjectId(cursor.id) } }
+        : { $or: [
+        { createdAt: { $lt: new Date(cursor.date) } },
+        { createdAt: new Date(cursor.date), _id: { $lt: new Types.ObjectId(cursor.id) } },
+        { createdAt: null },
+      ] }]);
+      if (!params.cursor && group === 0 && offset >= followingCount) { offset -= followingCount; continue; }
+      const found = await part.sort({ createdAt: -1, _id: -1 }).skip(offset).limit(size + 1 - rows.length).exec();
+      offset = 0;
+      rows.push(...found); groups.push(...found.map(() => group));
+    }
+    const hasMore = rows.length > size;
+    rows = rows.slice(0,size);
+    const last = rows[rows.length-1];
+    const nextCursor = hasMore && last ? Buffer.from(JSON.stringify({ group: groups[rows.length-1],
+      asOf: cursor.asOf, fingerprint, legacy: !last.createdAt,
+      date: new Date(last.createdAt || last._id.getTimestamp()).toISOString(), id: String(last._id) })).toString('base64url') : undefined;
+    return { posts: rows, count, nextCursor };
   }
 
   async getFollowStatusForUser(followerId: string, followingId: string): Promise<string> {
     const follow = await this.followModel.findOne({ follower: followerId, following: followingId });
 
-    if (!follow) {
+    if (!follow || follow.status === FollowStatus.REJECTED) {
       return 'None';
     }
 
@@ -465,6 +529,10 @@ export class PostsService {
     if (!post) throw new NotFoundException('Post not found');
     const owner = post.user.toString();
     if (owner === userId) return post;
+    const account = await this.postsModel.db.model('Users').findById(owner).select('isPrivate');
+    if (account?.isPrivate === true && !await this.followModel.exists({
+      follower: userId, following: owner, status: FollowStatus.ACCEPTED,
+    })) throw new ForbiddenException('Post unavailable');
     if (post.status === EPostStatus.APPROVED) {
       if (post.visibility === EPostVisibility.PUBLIC) return post;
       if (

@@ -8,6 +8,10 @@ export async function canReadPost(db: Connection, postId: string, viewer: string
   const owner = String(post.user);
   if (owner === viewer) return true;
   if (post.status !== 'approved') return false;
+  const account = await db.db.collection('Users').findOne({ _id: new Types.ObjectId(owner) }, { projection: { isPrivate: 1 } });
+  if (account?.isPrivate === true && !await db.db.collection('follows').findOne({
+    follower: new Types.ObjectId(viewer), following: new Types.ObjectId(owner), status: 'accepted',
+  })) return false;
   if (post.visibility === 'public') return true;
   if (post.visibility === 'friends') return !!await db.db.collection('follows').findOne({
     follower: new Types.ObjectId(viewer), following: new Types.ObjectId(owner), status: 'accepted',

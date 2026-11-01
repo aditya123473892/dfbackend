@@ -393,17 +393,20 @@ export class PhotosService implements OnModuleInit {
   }
 
   /** Context is obtained from the authorized response's resource ID, then verified against DB. */
-  async present(value: any, requester?: string, inherited?: ResourceContext, adminPosts = false): Promise<any> {
+  async present(value: any, requester?: string, inherited?: ResourceContext, adminPosts = false,
+    contexts = new Map<string, Promise<ResourceContext | undefined>>()): Promise<any> {
     if (!value || typeof value !== 'object') return value;
     if (isMappedPostImage(value)) return value;
     if (value instanceof Date || value._bsontype || Buffer.isBuffer(value)) return value;
-    if (Array.isArray(value)) return (await Promise.all(value.map(item => this.present(item, requester, inherited, adminPosts)))).filter(item => item !== null);
+    if (Array.isArray(value)) return (await Promise.all(value.map(item => this.present(item, requester, inherited, adminPosts, contexts)))).filter(item => item !== null);
     let source = value.toObject ? value.toObject() : value;
     if ([source.storageKey, source.filename, source.url].some(item => typeof item === 'string' && (item.includes('/vault/') || item.startsWith('vault/')))) return null;
     let context = inherited;
     // Never infer ownership or resource type from a photo key or client metadata.
     if (source._id && Types.ObjectId.isValid(String(source._id))) {
-      context = await this.responseContext(String(source._id), requester) || inherited;
+      const id = String(source._id);
+      if (!contexts.has(id)) contexts.set(id, this.responseContext(id, requester));
+      context = await contexts.get(id) || inherited;
     }
     if (context?.resourceType === 'post' && context.resourceId === String(source._id)) {
       const persisted = await this.db.db.collection('Posts').findOne({ _id: new Types.ObjectId(context.resourceId) });
@@ -420,7 +423,9 @@ export class PhotosService implements OnModuleInit {
         ? await this.db.db.collection('Users').findOne({ _id: new Types.ObjectId(requester) }, { projection: { premiumUntil: 1 } }) : null;
       const ownLike = requester && Types.ObjectId.isValid(requester)
         ? await this.db.db.collection('Likes').findOne({ post: persisted._id, user: new Types.ObjectId(requester) }, { projection: { _id: 1 } }) : null;
-      source = await new PostMapper().toResponse({ ...source, likeCount: (persisted.likes || []).length, likedByMe: !!ownLike, media: persisted.media || [], videos: persisted.videos || [],
+      source = await new PostMapper().toResponse({ ...source,
+        likeCount: Number.isFinite(source.likeCount) ? source.likeCount : (source.likes || persisted.likes || []).length,
+        likedByMe: !!ownLike, media: persisted.media || [], videos: persisted.videos || [],
         flag: persisted.flag, contentVisibility: persisted.contentVisibility || 'normal', user: source.user || persisted.user },
         { id: requester, premiumUntil: viewer?.premiumUntil, admin: adminPosts }, {
           canRead: async () => {
@@ -455,7 +460,7 @@ export class PhotosService implements OnModuleInit {
       if (['avatar', 'groupIcon'].includes(field)) {
         const expected = field === 'avatar' ? 'profile' : 'group';
         result[field] = context?.resourceType === expected ? await this.displayUrl(String(item || ''), context) : '';
-      } else result[field] = await this.present(item, requester, context, adminPosts);
+      } else result[field] = await this.present(item, requester, context, adminPosts, contexts);
     }
     const key = source.storageKey || source.filename;
     if (key || (source.url && source.mimetype))
@@ -1016,6 +1021,8 @@ export class PhotosService implements OnModuleInit {
       .collection('PostRequest')
       .deleteMany({ $or: [{ userId: id }, { requestedUserId: id }] });
     await this.db.db.collection('Notifications').deleteMany({ $or: [{ sender: id }, { receiver: id }] });
+    await this.db.db.collection('PushTokens').deleteMany({ owner });
+    await this.db.db.collection('PushDeliveries').deleteMany({ $or: [{ owner }, { sender: owner }] });
     await this.db.db.collection('EventMembers').deleteMany({ $or: [{ user: id }, { event: { $in: events.map((event) => event._id) } }] });
     await this.db.db.collection('UserBlocks').deleteMany({ $or: [{ blockerId: id }, { blockedId: id }] });
     await this.db.db.collection('UserEdits').deleteMany({ user: id });

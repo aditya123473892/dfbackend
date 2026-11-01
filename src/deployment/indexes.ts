@@ -19,6 +19,7 @@ export async function assertDeploymentIndexes(db: Connection) {
     ['VaultPhotos', { owner: 1, id: 1 }], ['VaultPhotos', { owner: 1, slot: 1 }],
     ['PhotoUploads', { owner: 1, requestId: 1 }], ['PhotoUploads', { owner: 1, slot: 1 }],
     ['UserBlocks', { blockerId: 1, blockedId: 1 }],
+    ['follows', { follower: 1, following: 1 }],
   ];
   for (const [collection, key] of required) {
     const indexes = await db.db.collection(collection).listIndexes().toArray();

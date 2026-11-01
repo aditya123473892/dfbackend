@@ -3,6 +3,7 @@ import { createConnection, Schema } from 'mongoose';
 import { readdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { migrateIndexes, assertDeploymentIndexes } from './indexes';
+import { socialIndexes } from '../users/social-indexes';
 
 async function main() {
   if (!process.env.DATABASE_URL || !process.env.DATABASE_NAME) throw new Error('DATABASE_URL and DATABASE_NAME are required');
@@ -12,6 +13,7 @@ async function main() {
   try {
     const hello = await db.db.admin().command({ hello: 1 });
     if (!hello.setName && hello.msg !== 'isdbgrid') throw new Error('MongoDB must be a replica set or sharded cluster');
+    await socialIndexes(db);
     const directory = join(__dirname, '../common/schemas');
     for (const file of readdirSync(directory).filter(name => name.endsWith('.schema.js'))) {
       const exports = require(join(directory, file));

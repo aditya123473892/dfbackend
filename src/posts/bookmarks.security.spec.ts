@@ -13,7 +13,8 @@ describe('Bookmark visibility', () => {
       find: jest.fn().mockReturnValue({ populate: async () => [{ postId: populated }] }),
       findOne: jest.fn().mockResolvedValue({ status: false, save: jest.fn().mockResolvedValue({ status: true }) }),
     };
-    const posts: any = { findById: jest.fn(async () => post) };
+    const posts: any = { findById: jest.fn(async () => post),
+      db: { model: () => ({ findById: () => ({ select: async () => ({ isPrivate: false }) }) }) } };
     const follows: any = { exists: jest.fn().mockResolvedValue(null), findOne: jest.fn().mockResolvedValue(null) };
     const requests: any = { exists: jest.fn().mockResolvedValue(null) };
     const service = new PostsService(posts, {} as any, {} as any, follows, requests, bookmarks);
@@ -50,7 +51,8 @@ describe('Bookmark visibility', () => {
   it('denies media access without a live private grant and applies grant expiry predicates', async () => {
     const grant = jest.fn().mockResolvedValue(null);
     const db: any = { db: { collection: (name) => ({ findOne: name === 'Posts'
-      ? async () => ({ user: owner, status: 'approved', visibility: 'private' }) : grant }) } };
+      ? async () => ({ user: owner, status: 'approved', visibility: 'private' })
+      : name === 'Users' ? async () => ({ isPrivate: false }) : grant }) } };
     expect(await canReadPost(db, id, viewer)).toBe(false);
     grant.mockResolvedValue({ status: 'accepted' });
     expect(await canReadPost(db, id, viewer)).toBe(true);

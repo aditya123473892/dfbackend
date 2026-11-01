@@ -21,6 +21,7 @@ describe('Post comments contract', () => {
 
   beforeEach(() => {
     posts = {
+      db: { model: () => ({ findById: () => ({ select: async () => ({ isPrivate: false }) }) }) },
       findById: jest
         .fn()
         .mockResolvedValue({

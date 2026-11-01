@@ -11,6 +11,8 @@ import {
 import { JwtService } from '@nestjs/jwt';
 import { Server, Socket } from 'socket.io';
 import { ObjectId } from 'mongodb';
+import { Optional } from '@nestjs/common';
+import { NotificationService } from '../notification/notification.service';
 import { ChatService } from './chats.service';
 import { ERole } from 'src/common/enums';
 import { PhotosService } from '../photos/photos.service';
@@ -51,9 +53,12 @@ export class ChatGateway
     private readonly jwtService: JwtService,
     private readonly photos: PhotosService,
     private readonly blocks: BlockService,
+    @Optional() private readonly notifications?: NotificationService,
   ) {}
 
   afterInit(server: Server) {
+    this.notifications?.changes$.subscribe(({ receiver, relationships }) =>
+      server.to('user:' + receiver).emit('notificationChanged', { relationships: relationships === true }));
     this.blocks.suspensionChanges$?.subscribe((owner) => server.in(`user:${owner}`).disconnectSockets(true));
     this.blocks.restrictedChanges$?.subscribe(() => {
       // Every process watches MongoDB. Local broadcast avoids duplicate adapter

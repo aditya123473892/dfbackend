@@ -3,6 +3,21 @@ import { blockContext } from '../user-blocks/block-context';
 
 describe('Public profile response privacy', () => {
   const owner = '507f1f77bcf86cd799439011', viewer = '507f1f77bcf86cd799439012';
+  it('retains caller-relative relationship state and resolves repeated author identity once per response', async () => {
+    const service = new PhotosService({} as any, {} as any);
+    const context = jest.spyOn(service as any, 'responseContext').mockResolvedValue({
+      ownerId: owner, resourceId: owner, resourceType: 'profile',
+    });
+    const source = { _id: owner, displayname: 'Public', relationship: { status: 'requested', requestId: viewer },
+      followers: 3, following: 2, password: 'secret' };
+    const result = await service.present({ users: Array.from({ length: 20 }, () => source) },viewer);
+    expect(context).toHaveBeenCalledTimes(1);
+    expect(result.users).toHaveLength(20);
+    expect(result.users[0]).toEqual({ _id: owner, displayname: 'Public', followers: 3, following: 2,
+      relationship: { status: 'requested', requestId: viewer } });
+    await service.present(source,viewer);
+    expect(context).toHaveBeenCalledTimes(2); // Never share the memo across HTTP responses.
+  });
   it('strips private fields from nested populated users but preserves self and authorized staff views', async () => {
     const service = new PhotosService({} as any, {} as any);
     jest.spyOn(service as any, 'responseContext').mockResolvedValue({

@@ -18,6 +18,7 @@ import { ChatGateway } from '../chats/chats.gateway';
 import { PostsService } from '../posts/posts.service';
 import { EventsService } from '../events/events.service';
 import { PhotosService } from '../photos/photos.service';
+import { VideosService } from '../photos/videos.service';
 import { S3BucketService } from '../s3-bucket/s3-bucket.service';
 import { JwtStrategy } from '../common/guards/jwt.strategy';
 import { ResponseInterceptor } from '../common/interceptors';
@@ -97,9 +98,12 @@ integration('Phase 2 report preservation', () => {
       imports: [PassportModule.register({ defaultStrategy: 'jwt' })],
       controllers: [ReportsController, PostsController, EventsController, ChatsController],
       providers: [
+        { provide: VideosService, useValue: { release: async () => undefined } },
         { provide: ChatService, useFactory: chats },
         { provide: PhotosService, useValue: new PhotosService(db, storage) },
-        { provide: PostsService, useValue: new PostsService(models.Posts, {} as any, {} as any, {} as any, {} as any, {} as any) },
+        { provide: PostsService, useValue: new PostsService(models.Posts, {} as any,
+          { deleteMany: async () => ({ deletedCount: 0 }) } as any, {} as any, {} as any,
+          { deleteMany: async () => ({ deletedCount: 0 }) } as any) },
         { provide: EventsService, useValue: new EventsService(models.Events, {} as any) },
         { provide: ChatGateway, useValue: { broadcastSavedMessage: jest.fn() } },
         { provide: S3BucketService, useValue: storage },

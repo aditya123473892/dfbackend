@@ -353,6 +353,12 @@ export class S3BucketService implements OnModuleInit {
     return scanner
       .detectModerationLabels({ Image: { Bytes: clean }, MinConfidence: 60 });
   }
+  async verifyEncryptedBackup(key: string, size: number) {
+    const head = await this.s3.headObject({ Bucket: this.bucketFor(key), Key: key });
+    if (head.ContentLength !== size || !['AES256', 'aws:kms', 'aws:kms:dsse'].includes(head.ServerSideEncryption))
+      throw new BadRequestException('Cloud encryption verification failed');
+    return true;
+  }
   async putApproved(key: string, bytes: Buffer) {
     return this.s3
       .putObject({

@@ -1,3 +1,6 @@
+import { Optional } from '@nestjs/common';
+import { NotificationService } from '../notification/notification.service';
+import { ENotificationType } from '../common/enums/notifications.enum';
 import { BlockService } from '../user-blocks/block.service';
 import { bsonIds, referenceId } from '../user-blocks/block-context';
 import { preservationGate, preserveMutation } from '../reports/preservation';
@@ -138,7 +141,17 @@ export class ChatService {
     private readonly blocks: BlockService,
     @InjectModel(ChatReadCursor.name)
     private readonly readCursorModel?: Model<ChatReadCursorDocument>,
+    @Optional() private readonly notifications?: NotificationService,
   ) {}
+
+  private async notifyMessage(message: any) {
+    if (this.notifications && message.receiver && !message.groupId) {
+      await this.notifications.sendNotification(String(message.receiver), String(message.sender),
+        ENotificationType.DIRECT_MESSAGE, 'New direct message',
+        { navigation: { conversationId: 'user:' + String(message.sender) } }, 'message:' + String(message._id));
+    }
+    return this.toClientMessage(message);
+  }
 
   async updateUserStatus(userId: string, isOnline: boolean): Promise<void> {
     if (!ObjectId.isValid(userId)) return;
@@ -199,7 +212,7 @@ export class ChatService {
     const sentAt = new Date();
     const expiresAt = this.messageExpiry(sentAt, data.ttlSeconds);
     const existing = await this.findIdempotentMessage(data.sender, clientId, data);
-    if (existing) return existing;
+    if (existing) return this.notifyMessage(existing);
     try {
       const saved = await new this.chatMessageModel({
         sender: toObjectId(data.sender),
@@ -207,11 +220,11 @@ export class ChatService {
         groupId: data.groupId ? toObjectId(data.groupId) : undefined,
         message: text, type: data.type || 'text', clientId, sentAt, expiresAt,
       }).save();
-      return this.toClientMessage(saved);
+      return this.notifyMessage(saved);
     } catch (error) {
       // A concurrent retry with the same key won the insert; return its record.
       const duplicate = isDuplicateKeyError(error) && await this.findIdempotentMessage(data.sender, clientId, data);
-      if (duplicate) return duplicate;
+      if (duplicate) return this.notifyMessage(duplicate);
       throw error;
     }
   }
@@ -261,7 +274,7 @@ export class ChatService {
       _id: id,
       sender: actorId,
     });
-    if (existing) return this.toClientMessage(existing);
+    if (existing) return this.notifyMessage(existing);
     const expiresAt = dto.ttlSeconds
       ? new Date(Date.now() + dto.ttlSeconds * 1000)
       : this.resolveExpiry(dto.expiresAt);
@@ -310,7 +323,7 @@ export class ChatService {
         size: media.size,
       });
     }
-    return this.toClientMessage(saved);
+    return this.notifyMessage(saved);
   }
 
   /**

@@ -1,4 +1,7 @@
-import { BadRequestException, Injectable } from '@nestjs/common';
+import { randomUUID } from 'crypto';
+import { NotificationService } from '../notification/notification.service';
+import { ENotificationType } from '../common/enums/notifications.enum';
+import { BadRequestException, Injectable, Optional } from '@nestjs/common';
 import { authorizeRoleGrant, changeRoles, protectLastRoot, validateRoles } from './role-policy';
 import { preservationGate } from '../reports/preservation';
 import { BlockService } from '../user-blocks/block.service';
@@ -7,7 +10,7 @@ import { visiblePostQuery } from '../user-blocks/visible-post';
 import { ObjectId } from 'mongodb';
 import { CreateUserDto, FilterUsersDto, UpdateUserDto } from './dtos';
 import { InjectModel } from '@nestjs/mongoose';
-import { Model, SortOrder } from 'mongoose';
+import { ClientSession, Model, SortOrder } from 'mongoose';
 import { Posts, Users, UsersDocument } from '../common/schemas';
 import { EBlockedByEnum, ERole } from 'src/common/enums';
 import { EJotFormStatus } from 'src/common/enums/users.enum';
@@ -79,6 +82,7 @@ export class UsersService {
     @InjectModel(ChatMessage.name)
     private chatMessageModel: Model<ChatMessageDocument>,
     private readonly blocks: BlockService,
+    @Optional() private readonly notifications?: NotificationService,
   ) {}
 
   async findByUsername(username: string) {
@@ -158,7 +162,7 @@ export class UsersService {
     });
   }
 
-  async findAll(params: FilterUsersDto) {
+  async findAll(params: FilterUsersDto, viewerId?: string) {
     const query = this.usersModel.find();
 
     // Search input is escaped: it is matched literally, never as a pattern.
@@ -200,27 +204,67 @@ export class UsersService {
       query.skip(params.skip);
     }
 
+    query.limit(Math.min(50, Math.max(1, Number(params.limit) || 20)));
     const users = await query.exec();
     const count = await this.usersModel.countDocuments(query.getQuery());
 
-    const usersWithPosts = await Promise.all(
-      users.map(async (user) => {
-        const userPosts = await visiblePostQuery(
-          this.postModel.find({
-            user: user._id,
-            visibility: EPostVisibility.PUBLIC,
-            status: EPostStatus.APPROVED,
-          }),
-        ).exec();
+    const profiles = await this.socialProfiles(users, viewerId);
+    if (params.summary === 'true') return { users: profiles, count };
+    // Preserve the legacy full response; mobile Discover requests summaries.
+    const posts = await visiblePostQuery(this.postModel.find({
+      user: { $in: profiles.filter(u => u.isPrivate !== true || String(u._id) === viewerId ||
+        u.relationship.status === 'following').map(u => u._id) }, visibility: EPostVisibility.PUBLIC,
+      status: EPostStatus.APPROVED,
+    })).lean().exec();
+    const byUser = new Map<string, any[]>();
+    for (const post of posts) {
+      const key = String(post.user);
+      if (!byUser.has(key)) byUser.set(key, []);
+      byUser.get(key).push(post);
+    }
+    return { users: profiles.map(user => ({
+      ...user, usersPost: byUser.get(String(user._id)) || [],
+    })), count };
+  }
 
-        return {
-          ...user.toObject(),
-          usersPost: userPosts,
-        };
-      }),
-    );
+  /** Counts always come from accepted edges, never stale imported counters. */
+  async socialProfiles(users: any[], viewerId?: string) {
+    if (!users.length) return users;
+    const ids = users.map(u => new ObjectId(String(u._id)));
+    const [incoming, outgoing, relations] = await Promise.all([
+      this.followModel.aggregate([{ $match: { following: { $in: ids }, status: 'accepted' } },
+        { $group: { _id: '$following', count: { $sum: 1 } } }]),
+      this.followModel.aggregate([{ $match: { follower: { $in: ids }, status: 'accepted' } },
+        { $group: { _id: '$follower', count: { $sum: 1 } } }]),
+      viewerId ? this.followModel.find({ follower: viewerId, following: { $in: ids },
+        status: { $in: ['pending', 'accepted'] } }).lean() : [],
+    ]);
+    const counts = (rows: any[]) => new Map(rows.map(row => [String(row._id), row.count]));
+    const followers = counts(incoming), following = counts(outgoing);
+    const edges = new Map<string, any>(relations.map(row => [String(row.following), row] as [string, any]));
+    return users.map(source => {
+      const user = source.toObject ? source.toObject() : source;
+      const id = String(user._id), edge = edges.get(id);
+      return { ...user, followers: followers.get(id) || 0, following: following.get(id) || 0,
+        relationship: { status: edge?.status === 'accepted' ? 'following' : edge?.status === 'pending' ? 'requested' : 'none',
+          ...(edge ? { requestId: String(edge._id) } : {}) } };
+    });
+  }
 
-    return { users: usersWithPosts, count };
+  async relationship(viewer: string, target: string) {
+    if (!ObjectId.isValid(target)) throw new BadRequestException('Invalid user');
+    await this.blocks.assertVisible(viewer, target);
+    const user = await this.usersModel.findById(target);
+    if (!user) throw new BadRequestException('User not found');
+    return (await this.socialProfiles([user], viewer))[0].relationship;
+  }
+
+  async followCounts(userId: string) {
+    const [followers, following] = await Promise.all([
+      this.followModel.countDocuments({ following: userId, status: FollowStatus.ACCEPTED }),
+      this.followModel.countDocuments({ follower: userId, status: FollowStatus.ACCEPTED }),
+    ]);
+    return { followers, following };
   }
 
   async findById(_id: string) {
@@ -237,7 +281,7 @@ export class UsersService {
     ).exec();
 
     return {
-      ...user.toObject(),
+      ...(await this.socialProfiles([user], _id))[0],
       usersPost: userPosts,
     };
   }
@@ -253,7 +297,7 @@ export class UsersService {
     if (!user) return null;
     if (viewerId && String(viewerId) === String(id)) {
       return {
-        ...user.toObject(),
+        ...(await this.socialProfiles([user], viewerId))[0],
         usersPost: await this.postModel
           .find({ user: id })
           .sort({ createdAt: -1 })
@@ -262,6 +306,9 @@ export class UsersService {
       };
     }
     const today = new Date();
+    if (user.isPrivate === true && !await this.followModel.exists({
+      follower: viewerId, following: id, status: FollowStatus.ACCEPTED,
+    })) return { ...(await this.socialProfiles([user], viewerId))[0], usersPost: [] };
     const hasAccess = await this.PostRequestModel.findOne({
       userId: id,
       requestedUserId: viewerId,
@@ -298,7 +345,7 @@ export class UsersService {
     const userPosts = await visiblePostQuery(this.postModel.find(query)).exec();
 
     return {
-      ...user.toObject(),
+      ...(await this.socialProfiles([user], viewerId))[0],
       usersPost: userPosts,
     };
   }
@@ -532,77 +579,107 @@ export class UsersService {
     return user;
   }
 
-  async sendFollowRequest(
-    followerId: string,
-    followingId: string,
-  ): Promise<Follow> {
-    if (
-      !ObjectId.isValid(followingId) ||
-      !(await this.usersModel.exists({ _id: followingId }))
-    )
-      throw new Error('User not found!');
-    await this.blocks.assertVisible(followerId, followingId);
-    const existingFollow = await this.followModel.findOne({
-      follower: followerId,
-      following: followingId,
-    });
-    if (existingFollow) {
-      throw new Error('Follow request already sent or relationship exists');
-    }
-
-    const follow = new this.followModel({
-      follower: followerId,
-      following: followingId,
-      status: FollowStatus.PENDING,
-    });
-    const saved = await follow.save();
-    if (await this.blocks.isBlockedEitherWay(followerId, followingId)) {
-      await this.followModel.updateOne(
-        { _id: saved._id, status: FollowStatus.PENDING },
-        { $set: { status: FollowStatus.REJECTED } },
-      );
-      throw new Error('User not found!');
-    }
+  async sendFollowRequest(followerId: string, followingId: string): Promise<Follow> {
+    const saved = await this.followTransaction(session => this.writeFollowRequest(followerId, followingId, session));
+    this.notifications?.socialChanged(followerId, followingId);
     return saved;
   }
 
-  async approveFollowRequest(
-    followId: string,
-    status: FollowStatus,
-    actorId: string,
-  ): Promise<Follow> {
-    const follow = await this.followModel.findById(followId);
-    if (
-      !follow ||
-      String(follow.following) !== actorId ||
-      follow.status !== FollowStatus.PENDING
-    ) {
-      throw new Error('Follow request not found');
+  /** Retry pair-index races in a fresh transaction; never read from an aborted transaction. */
+  private async followTransaction<T>(write: (session: ClientSession) => Promise<T>): Promise<T> {
+    const deadline = Date.now() + 10_000;
+    for (let attempt = 0; ; attempt++) {
+      try {
+        return await this.followModel.db.transaction(session => {
+          if (Date.now() >= deadline) throw new Error('Relationship transaction timed out');
+          return write(session);
+        }, { maxCommitTimeMS: 5000, readConcern: { level: 'snapshot' }, writeConcern: { w: 'majority' } });
+      } catch (error) {
+        if (error?.code !== 11000 || attempt >= 2 || Date.now() >= deadline) throw error;
+      }
     }
+  }
 
-    if (![FollowStatus.ACCEPTED, FollowStatus.REJECTED].includes(status))
-      throw new Error('Invalid follow status');
-    await this.blocks.assertVisible(actorId, String(follow.follower));
-    const updated = await this.followModel.findOneAndUpdate(
-      { _id: followId, following: actorId, status: FollowStatus.PENDING },
-      { $set: { status } },
-      { new: true },
-    );
-    if (!updated) throw new Error('Follow request not found');
-    await this.blocks.assertVisible(actorId, String(follow.follower));
+  private async writeFollowRequest(followerId: string, followingId: string, session: ClientSession): Promise<Follow> {
+    if (!ObjectId.isValid(followingId) || followerId === followingId)
+      throw new BadRequestException('Invalid follow target');
+    await this.blocks.assertVisible(followerId, followingId);
+    const user = await this.usersModel.findById(followingId).select('isPrivate').session(session);
+    if (!user) throw new BadRequestException('User not found');
+    const status = user.isPrivate === false ? FollowStatus.ACCEPTED : FollowStatus.PENDING;
+    const pair = { follower: followerId, following: followingId };
+    // A conditional single-document write and unique pair index arbitrate concurrent callers.
+    let saved = await this.followModel.findOne(pair).session(session);
+    if (saved?.status === FollowStatus.REJECTED) saved = await this.followModel.findOneAndUpdate(
+      { ...pair, status: FollowStatus.REJECTED }, { $set: { status, requestKey: randomUUID() } }, { new: true, session });
+    if (!saved) {
+      saved = await this.followModel.findOneAndUpdate(pair,
+        { $setOnInsert: { ...pair, status, requestKey: randomUUID() } }, { upsert: true, new: true, session });
+    }
+    if (!saved) throw new BadRequestException('Follow changed; retry');
+    if (await this.blocks.isBlockedEitherWay(followerId, followingId)) {
+      throw new BadRequestException('User not found');
+    }
+    if (saved.status === FollowStatus.PENDING && this.notifications)
+      await this.notifications.sendNotification(followingId, followerId, ENotificationType.FOLLOW_REQUEST,
+        'New follow request', { navigation: { profileId: followerId, requestId: String(saved._id) } },
+        'follow:' + saved._id + ':' + (saved.requestKey || 'legacy'), session);
+    return saved;
+  }
+
+  async approveFollowRequest(followId: string, status: FollowStatus, actorId: string): Promise<Follow> {
+    const updated = await this.followTransaction(session => this.writeFollowApproval(followId, status, actorId, session));
+    this.notifications?.socialChanged(String(updated.follower), actorId);
     return updated;
   }
 
-  async unfollowUser(followerId: string, followingId: string): Promise<Follow> {
-    const follow = await this.followModel.findOneAndDelete({
-      follower: followerId,
-      following: followingId,
-    });
-    if (!follow) {
-      throw new Error('Follow relationship not found');
+  private async writeFollowApproval(followId: string, status: FollowStatus, actorId: string, session: ClientSession): Promise<Follow> {
+    if (!ObjectId.isValid(followId) || ![FollowStatus.ACCEPTED, FollowStatus.REJECTED].includes(status))
+      throw new BadRequestException('Invalid follow request');
+    const follow = await this.followModel.findOne({ _id: followId, following: actorId }).session(session);
+    if (!follow) throw new BadRequestException('Follow request not found');
+    await this.blocks.assertVisible(actorId, String(follow.follower));
+    if (follow.status === status) {
+      await this.notifyFollowAccepted(follow, actorId, session);
+      return follow;
     }
+    const updated = await this.followModel.findOneAndUpdate(
+      { _id: followId, following: actorId, status: FollowStatus.PENDING },
+      { $set: { status } }, { new: true, session });
+    if (!updated) {
+      const latest = await this.followModel.findOne({ _id: followId, following: actorId, status }).session(session);
+      if (latest) { await this.notifyFollowAccepted(latest, actorId, session); return latest; }
+      throw new BadRequestException('Follow request is no longer pending');
+    }
+    if (await this.blocks.isBlockedEitherWay(actorId, String(follow.follower))) {
+      throw new BadRequestException('User not found');
+    }
+    await this.notifyFollowAccepted(updated, actorId, session);
+    return updated;
+  }
 
-    return follow;
+  private async notifyFollowAccepted(follow: any, actorId: string, session?: ClientSession) {
+    if (follow.status === FollowStatus.ACCEPTED && this.notifications)
+      await this.notifications.sendNotification(String(follow.follower), actorId, ENotificationType.FOLLOW_ACCEPTED,
+        'Follow request accepted', { navigation: { profileId: actorId } }, 'accepted:' + follow._id + ':' + (follow.requestKey || 'legacy'), session);
+  }
+
+  async unfollowUser(followerId: string, followingId: string): Promise<Follow> {
+    if (!ObjectId.isValid(followingId)) throw new BadRequestException('Invalid user');
+    const removed = await this.followModel.findOneAndDelete({ follower: followerId, following: followingId });
+    this.notifications?.socialChanged(followerId, followingId);
+    return removed;
+  }
+
+  async cancelFollowRequest(actor: string, id: string) {
+    if (!ObjectId.isValid(id)) throw new BadRequestException('Invalid request');
+    const removed = await this.followModel.findOneAndDelete({ _id: id, follower: actor, status: FollowStatus.PENDING });
+    if (removed) this.notifications?.socialChanged(actor, String(removed.following));
+  }
+
+  async getOutgoingRequests(userId: string) {
+    return this.followModel.find({ follower: userId, status: FollowStatus.PENDING })
+      .populate('following', 'displayname avatar firstName lastName').sort({ _id: -1 });
   }
 
   async getFollowRequests(userId: string): Promise<Follow[]> {
@@ -613,11 +690,11 @@ export class UsersService {
       })
       .populate({
         path: 'follower',
-        select: 'username displayname avatar',
+        select: 'displayname avatar firstName lastName',
       })
       .populate({
         path: 'following',
-        select: 'username displayname avatar',
+        select: 'displayname avatar firstName lastName',
       });
   }
 
@@ -626,9 +703,9 @@ export class UsersService {
       follower: userId,
       status: FollowStatus.ACCEPTED,
     });
-    return this.usersModel.find({
+    return this.socialProfiles(await this.usersModel.find({
       _id: { $in: follows.map((f) => f.following) },
-    });
+    }), userId);
   }
 
   async getFollowers(userId: string): Promise<UsersDocument[]> {
@@ -636,9 +713,9 @@ export class UsersService {
       following: userId,
       status: FollowStatus.ACCEPTED,
     });
-    return this.usersModel.find({
+    return this.socialProfiles(await this.usersModel.find({
       _id: { $in: follows.map((f) => f.follower) },
-    });
+    }), userId);
   }
 
   async findUnverifiedUsers(): Promise<UsersDocument[]> {
