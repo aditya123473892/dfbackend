@@ -9,11 +9,14 @@ import { ConfigService } from '@nestjs/config';
 import { getConnectionToken } from '@nestjs/mongoose';
 import { Connection } from 'mongoose';
 import { applicationValidationPipe } from './common/validation';
+import { assertDeploymentIndexes } from './deployment/indexes';
 
 async function bootstrap() {
   dotenv.config(); // Load environment variables from .env file
-  const configService = new ConfigService();
   const app = await NestFactory.create(AppModule);
+  const configService = app.get(ConfigService);
+  app.enableShutdownHooks();
+  app.getHttpAdapter().getInstance().disable('x-powered-by');
   app.setGlobalPrefix('api');
 
   // Behind a load balancer, per-IP OTP limits need the client address from
@@ -42,7 +45,7 @@ async function bootstrap() {
     },
     credentials: true,
     methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
-    allowedHeaders: ['Content-Type', 'Authorization'],
+    allowedHeaders: ['Content-Type', 'Authorization', 'X-Client-Platform'],
   });
 
   // app.setGlobalPrefix('v1');
@@ -56,14 +59,14 @@ async function bootstrap() {
     .addTag('Dark Fantacy')
     .build();
 
+  if (process.env.NODE_ENV !== 'production' || process.env.SWAGGER_ENABLED === 'true') {
   const document = SwaggerModule.createDocument(app, config);
-
-  // if (process.env.NODE_ENV !== 'production')
   SwaggerModule.setup('docs', app, document, {
     swaggerOptions: {
       persistAuthorization: true,
     },
   });
+  }
 
   // Global response interceptor
   app.useGlobalInterceptors(
@@ -79,6 +82,7 @@ async function bootstrap() {
   // asynchronously). A failed build is logged rather than fatal; duplicate
   // legacy likes are fixed with `npm run db:repair-post-interactions`.
   const connection = app.get<Connection>(getConnectionToken());
+  if (process.env.NODE_ENV === 'production') await assertDeploymentIndexes(connection);
   const models = Object.values(connection.models);
   const builds = await Promise.allSettled(models.map((model) => model.init()));
   builds.forEach((result, index) => {
@@ -87,7 +91,10 @@ async function bootstrap() {
     }
   });
 
-  await app.listen(configService.get<string>('PORT'));
+  await app.listen(Number(configService.get<string>('PORT') || 9000), configService.get<string>('HOST') || '0.0.0.0');
   Logger.log(`Services running at PORT ${configService.get<string>('PORT')}`);
 }
-bootstrap();
+bootstrap().catch(() => {
+  Logger.error('Backend startup failed. Check configuration, database readiness and deployment indexes.');
+  process.exit(1);
+});

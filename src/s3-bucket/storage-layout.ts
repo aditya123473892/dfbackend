@@ -50,7 +50,7 @@ export function storedKey(row: any): string | undefined {
 }
 export function bucketForKey(key: string, fallback: string) {
   return (/^(previews|profile|posts|videos|events|groups)\//.test(key)
-    ? process.env.PHOTO_MEDIA_BUCKET : /^(temp|vault|chat|quarantine|reports)\//.test(key)
+    ? process.env.PHOTO_MEDIA_BUCKET : /^(temp|vault|chat|quarantine|reports|deleted)\//.test(key)
       ? process.env.PHOTO_PRIVATE_BUCKET : undefined) || fallback;
 }
 export function bindingFromRef(ownerId: string, ref: string): ResourceContext {

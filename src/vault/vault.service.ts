@@ -212,7 +212,8 @@ export class VaultService implements OnModuleInit {
     if (row) {
       // Wait beyond every outstanding POST/processing lease before final deletion.
       const deleteAfter = new Date(Math.max(row.state === 'processing' ? now + 300000 : now, row.expiresAt?.getTime() + 60000 || now, row.leaseUntil?.getTime() + 60000 || now));
-      await this.rows.updateOne({ owner, id }, { $set: { state: 'deleting', status: 'deleting', deletedAt: now, deleteAfter }, $unset: { token: '' } });
+      const archiveKeys = row.state === 'approved' ? [...new Set([storedKey(row), row.key].filter(Boolean))] : row.archiveKeys || [];
+      await this.rows.updateOne({ owner, id }, { $set: { state: 'deleting', status: 'deleting', deletedAt: now, deleteAfter, archiveKeys }, $unset: { token: '' } });
       await this.cleanup();
     }
     return { deleted: true };
@@ -222,8 +223,10 @@ export class VaultService implements OnModuleInit {
     const rows = await this.rows.find({ state: 'deleting', deleteAfter: { $lte: new Date() } }).limit(100).toArray();
     for (const row of rows) {
       try {
-        // Delete all object versions via the existing storage implementation.
-        for (const key of [row.tempKey, row.key, row.processingKey].filter(Boolean)) await this.storage.deleteOne(key);
+        // Copy and verify every approved original before removing any source. If S3
+        // fails, the hidden deleting row and originals remain for the next pass.
+        for (const key of row.archiveKeys || []) await this.storage.archiveDeletedVault(key, row.owner, row.id);
+        for (const key of [...new Set([row.tempKey, row.key, row.s3Key, row.processingKey, row.finalKey].filter(Boolean))]) await this.storage.deleteOne(key);
         await this.rows.deleteOne({ _id: row._id, state: 'deleting' });
       } catch { /* Durable deleting row stays present for the next worker pass. */ }
     }

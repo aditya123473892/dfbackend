@@ -7,6 +7,12 @@ export type KnowledgeEntry = { title: string; keywords: string[]; content: strin
 
 export const KNOWLEDGE: KnowledgeEntry[] = [
   {
+    title: 'Chat with God',
+    keywords: ['god', 'companion', 'fantasies', 'desires', 'feelings', 'consent', 'boundaries', 'sex', 'intimacy', 'libido', 'wellbeing'],
+    content:
+      'Chat with God is an AI companion for nonjudgmental, non-graphic conversations about fantasies, desires, sex life, sexual wellbeing, intimacy, relationships and emotions. Members choose what to share and can explore feelings, communicate with a partner and discuss consensual boundaries at their own pace. The AI can also help with app questions. Conversations are saved; DARKFANTASY staff can read them and join as a clearly identified team member. Past chats are available from the history button.',
+  },
+  {
     title: 'About DARKFANTASY',
     keywords: ['app', 'about', 'what', 'darkfantasy', 'dark', 'fantasy', 'community', 'purpose'],
     content:

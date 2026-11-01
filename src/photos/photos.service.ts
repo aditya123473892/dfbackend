@@ -810,6 +810,7 @@ export class PhotosService implements OnModuleInit {
     if (key.startsWith('temp/') && await this.videoUploads.findOne({ tempKey: key, state: { $in: ['pending', 'scanning'] } })) return true;
     if (key.startsWith('temp/')) return !!(await this.uploads.findOne({ key, state: { $in: ['approved', 'attached'] } }));
     if (await this.db.db.collection('VaultPhotos').findOne({ key, state: { $in: ['approved', 'processing'] } })) return true;
+    if (await this.db.db.collection('VaultPhotos').findOne({ archiveKeys: key, state: 'deleting' })) return true;
     if (key.startsWith('videos/') && (await this.videoUploads.findOne({ key, state: { $in: ['approved', 'attached'] } }) ||
       await this.db.db.collection('Posts').findOne({ 'videos.storageKey': key, deletedAt: null }, { projection: { _id: 1 } }))) return true;
     if (await this.uploads.findOne({ $or: [{ processingKey: key }, { previewProcessingKey: key }, { finalKey: key }], state: 'processing', leaseUntil: { $gt: new Date() } })) return true;
@@ -944,7 +945,7 @@ export class PhotosService implements OnModuleInit {
       add(video.finalKey);
       add(video.key);
     }
-    for (const prefix of [`previews/${owner}/`, `users/${owner}/`, `temp/${owner}/`, `profile/${owner}/`, `posts/${owner}/`, `videos/${owner}/`, `vault/${owner}/`])
+    for (const prefix of [`previews/${owner}/`, `users/${owner}/`, `temp/${owner}/`, `profile/${owner}/`, `posts/${owner}/`, `videos/${owner}/`, `vault/${owner}/`, `deleted/vault/${owner}/`])
       (await this.storage.keysUnder(prefix)).forEach(add);
     // Any failure keeps the account blocked and the durable job present.
     for (const key of keys) {

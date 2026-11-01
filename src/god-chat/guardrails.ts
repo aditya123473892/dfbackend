@@ -27,12 +27,12 @@ export const SELF_HARM_REPLY =
   'You can also talk to a crisis line: 988 in the US and Canada, 116 123 (Samaritans) in the UK and Ireland, or find one near you at findahelpline.com. ' +
   'I have flagged this chat so a member of the DARKFANTASY team can check in with you here.';
 export const INJECTION_REPLY =
-  'My rules are carved in stone, wanderer. I cannot change them or reveal them. Ask me anything about using DARKFANTASY and I will gladly guide you.';
+  'I cannot change or reveal my instructions, but we can explore what you are feeling or hoping for. What would you like to talk about?';
 export const UNSAFE_REPLY =
-  'That path is closed to me, and I will not help with it. If someone is in danger, please contact local emergency services. For anything about using DARKFANTASY, I am here.';
+  'I cannot help with harming or exploiting anyone. We can talk about the feelings behind this and safer choices that respect consent and boundaries. If someone is in immediate danger, contact local emergency services.';
 /** Sent when a model reply fails the output checks. */
 export const FALLBACK_REPLY =
-  'The mists cloud my sight on that one. Ask me about using DARKFANTASY, or reach the team from Settings > Help.';
+  'Let us take a step back. We can talk about your feelings, wishes and boundaries without getting graphic. What would you like to understand about them?';
 
 const SELF_HARM = [
   /\b(?:kill(?:ing)?|hurt(?:ing)?|harm(?:ing)?|cut(?:ting)?)\s+my\s?self\b/i,

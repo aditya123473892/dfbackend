@@ -1,0 +1,37 @@
+services:
+  backend:
+    build:
+      context: ..
+      target: runtime
+    image: darkfantasy-backend:local
+    env_file:
+      - ../.env.production
+    environment:
+      NODE_ENV: production
+      PORT: 9000
+      HOST: 0.0.0.0
+      TRUST_PROXY: 1
+    restart: unless-stopped
+    init: true
+    stop_grace_period: 30s
+    expose:
+      - "9000"
+  proxy:
+    image: caddy:2-alpine
+    environment:
+      API_DOMAIN: ${API_DOMAIN:?Set API_DOMAIN to the API hostname}
+      ACME_EMAIL: ${ACME_EMAIL:?Set ACME_EMAIL for TLS certificate renewal}
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      backend:
+        condition: service_healthy
+    restart: unless-stopped
+volumes:
+  caddy_data:
+  caddy_config:

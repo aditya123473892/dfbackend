@@ -1,6 +1,6 @@
-import { Body, Controller, Post, Req, UseGuards } from '@nestjs/common';
+import { Body, Controller, Get, Post, Query, Req, Res, UseGuards } from '@nestjs/common';
 import { ApiBearerAuth, ApiTags } from '@nestjs/swagger';
-import { Request } from 'express';
+import { Request, Response } from 'express';
 import { AuthUser } from 'src/common/decorators';
 import { IAuthUser } from 'src/common/interfaces';
 import { successRes } from 'src/common/interceptors';
@@ -8,6 +8,8 @@ import { LoginDto } from '../dtos';
 import { OtpSignupDto, PasswordLoginDto, PhoneDto, SendOtpDto, VerifyOtpDto } from './otp.dto';
 import { OtpService } from './otp.service';
 import { PhoneLinkGuard } from './phone-link.guard';
+import { isMobileClient, mobilePhoneAuthRequired } from 'src/common/guards/otp-session.guard';
+import { otpError } from './otp-errors';
 
 const clientIp = (req: Request) => req.ip || req.socket?.remoteAddress || 'unknown';
 
@@ -16,8 +18,22 @@ const clientIp = (req: Request) => req.ip || req.socket?.remoteAddress || 'unkno
 export class OtpController {
   constructor(private readonly otp: OtpService) {}
 
+  @Get('email/verify')
+  async verifyEmail(@Query('token') token: string, @Res() res: Response) {
+    await this.otp.verifyEmail(token);
+    res.setHeader('Cache-Control', 'no-store');
+    res.setHeader('Referrer-Policy', 'no-referrer');
+    return res.type('text/plain').send('Email verified. Return to DARKFANTASY and sign in.');
+  }
+
+  @Post('email/resend')
+  async resendEmail(@Body() dto: PasswordLoginDto, @Req() req: Request) {
+    return successRes(await this.otp.resendVerification(dto.identifier, dto.password, clientIp(req)));
+  }
+
   @Post('password/login')
   async passwordLogin(@Body() dto: PasswordLoginDto, @Req() req: Request) {
+    if (isMobileClient(req) && mobilePhoneAuthRequired()) throw otpError('PHONE_LOGIN_REQUIRED');
     return successRes(await this.otp.passwordLogin(dto.identifier, dto.password, clientIp(req)));
   }
 

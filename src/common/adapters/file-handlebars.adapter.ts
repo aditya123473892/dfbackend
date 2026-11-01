@@ -30,7 +30,7 @@ handlebars.registerHelper('ifEquals', function (a, b, options) {
 export class FileHandlebarsAdapter {
   private readonly templatesDir = path.join(
     __dirname,
-    '../../../../src/common/templates',
+    '../templates',
   );
 
   async compile(templateName: ETemplateEmail, context: any): Promise<string> {

@@ -8,7 +8,7 @@ describe('Password recovery request', () => {
     const users: any = { findOne: jest.fn().mockResolvedValue(null), updateOne: jest.fn().mockResolvedValue(user) };
     const mail: any = { resetPassword: jest.fn().mockResolvedValue({ MessageId: 'sent' }) };
     const controller = new AuthController({} as any, users, mail,
-      { get: () => 'abcdef0123456789'.repeat(4) } as any);
+      { get: () => 'abcdef0123456789'.repeat(4) } as any, {} as any);
     const absent = await controller.forgotPassword({ username: user.username });
     users.findOne.mockResolvedValue(user);
     const accepted = await controller.forgotPassword({ username: user.username });

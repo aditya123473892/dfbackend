@@ -1,0 +1,15 @@
+{
+  email {$ACME_EMAIL}
+}
+{$API_DOMAIN} {
+  # Caddy handles TLS renewal and Socket.IO/WebSocket upgrades.
+  reverse_proxy backend:9000 {
+    transport http {
+      response_header_timeout 300s
+    }
+  }
+  header {
+    X-Content-Type-Options nosniff
+    Referrer-Policy no-referrer
+  }
+}

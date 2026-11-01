@@ -31,7 +31,7 @@ import { PhoneLinkGuard } from './otp/phone-link.guard';
       imports: [ConfigModule],
       useFactory: async (configService: ConfigService) => ({
         signOptions: {
-          expiresIn: configService.get<string>('EXPIRES_IN'),
+          expiresIn: configService.get<string>('EXPIRES_IN') || '7d',
         },
         secret: configService.get<string>('JWT_SECRET'),
       }),

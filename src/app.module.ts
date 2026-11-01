@@ -32,6 +32,7 @@ import { blockContext, blockQueryPlugin } from './user-blocks/block-context';
 import { ReportsModule } from './reports/reports.module';
 import { GodChatModule } from './god-chat/god-chat.module';
 import { EntitlementsModule } from './entitlements/entitlements.module';
+import { HealthController } from './deployment/health.controller';
 
 @Module({
   imports: [
@@ -47,6 +48,7 @@ import { EntitlementsModule } from './entitlements/entitlements.module';
         uri: configService.get<string>('DATABASE_URL'),
         dbName: configService.get<string>('DATABASE_NAME'),
         autoIndex: false,
+        serverSelectionTimeoutMS: 10000,
         connectionFactory: (connection) => {
           connection.plugin(blockQueryPlugin);
           return connection;
@@ -80,7 +82,7 @@ import { EntitlementsModule } from './entitlements/entitlements.module';
     GodChatModule,
     ScheduleModule.forRoot(),
   ],
-  controllers: [AppController],
+  controllers: [AppController, HealthController],
   providers: [
     AppService,
     {

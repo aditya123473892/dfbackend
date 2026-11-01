@@ -15,10 +15,22 @@ const service = (
 const ask = (content: string) => ({ messages: [{ role: 'user', content }] });
 
 describe('Chat with God', () => {
-  it('retrieves the matching knowledge entries and falls back to the overview', () => {
+  it('retrieves app help when relevant without forcing an overview on personal conversations', () => {
     expect(selectKnowledge('How do I unlock my vault with a PIN?')[0]!.title).toBe('Photo Vault');
     expect(selectKnowledge('how do I block someone')[0]!.title).toBe('Safety: blocking and reporting');
-    expect(selectKnowledge('hello').map((entry) => entry.title)).toEqual(['About DARKFANTASY']);
+    expect(selectKnowledge('hello')).toEqual([]);
+  });
+
+  it('supports a non-graphic conversation about desires while preserving consent and staff disclosure', async () => {
+    const answer = 'It sounds like feeling wanted matters to you. What part of that feeling would you like to explore?';
+    const complete = jest.fn(async () => answer);
+    const content = 'I fantasize about feeling desired by my partner but I am nervous to tell them.';
+    await expect(service({ configured: true, complete }).reply('u1', ask(content))).resolves.toEqual({ reply: answer });
+    const [messages] = complete.mock.calls[0] as unknown as [{ role: string; content: string }[]];
+    expect(messages[0]!.content).toContain('fantasies, desires');
+    expect(messages[0]!.content).toContain('freely given consent');
+    expect(messages[0]!.content).toContain('Do not promise secrecy');
+    expect(messages.at(-1)).toEqual({ role: 'user', content });
   });
 
   it('sends persona, knowledge and history to the model and returns its reply', async () => {
@@ -29,6 +41,21 @@ describe('Chat with God', () => {
     expect(messages[0]!.role).toBe('system');
     expect(messages[0]!.content).toContain('## Events');
     expect(messages.slice(1)).toEqual([{ role: 'user', content: 'how to join an event' }]);
+  });
+
+  it.each([
+    'I want to talk about my sex life and feeling disconnected from my partner.',
+    'How can I share my desires without pressuring my partner?',
+    'My partner and I have different levels of libido. Can we talk about it?',
+    'I feel embarrassed about a fantasy and want to understand my feelings.',
+  ])('welcomes personal intimacy topics without routing them to app support: %s', async (content) => {
+    const answer = 'We can explore what you need and what feels comfortable for both of you. What would you like your partner to understand?';
+    const complete = jest.fn(async () => answer);
+    await expect(service({ configured: true, complete }).reply('u1', ask(content))).resolves.toEqual({ reply: answer });
+    const [messages] = complete.mock.calls[0] as unknown as [{ role: string; content: string }[]];
+    expect(messages[0]!.content).toContain('sex life, sexual wellbeing, intimacy, libido');
+    expect(messages[0]!.content).toContain('do not refuse a respectful, non-graphic question');
+    expect(messages.at(-1)).toEqual({ role: 'user', content });
   });
 
   it('is unavailable without an API key and never calls the model', async () => {

@@ -72,11 +72,12 @@ export class MailService {
    * @param {string} url - URL for verify account
    * @returns {Promise<any | null>} Returns mail response from AWS SES
    */
-  async verifyAccount(to: string, name: string) {
+  async verifyAccount(to: string, name: string, url?: string) {
     try {
       // Mock if AWS credentials are missing
-      if (!process.env.AWS_ACCESS_KEY || !process.env.AWS_SECRET || !process.env.AWS_SES_REGION) {
-        return { MessageId: "mock-message-id" };
+      if (!process.env.AWS_SES_REGION || !process.env.AWS_MAIL_FROM) {
+        if (['development', 'test'].includes(process.env.NODE_ENV || '')) return { MessageId: 'mock-message-id' };
+        throw new Error('Email delivery is not configured');
       }
       const AWS_MAIL_FROM = process.env.AWS_MAIL_FROM;
 
@@ -89,7 +90,7 @@ export class MailService {
       const html = await this.fileHandlebarsAdapter.compile(
         ETemplateEmail.VERIFY_ACCOUNT,
         {
-          name
+          name, url,
         },
       );
 
@@ -112,14 +113,19 @@ export class MailService {
         },
       };
 
-      const client = new SES({ region: awsConfig.region, credentials: { accessKeyId: awsConfig.accessKeyId, secretAccessKey: awsConfig.secretAccessKey } });
+      const accessKeyId = process.env.AWS_ACCESS_KEY || process.env.AWS_ACCESS_KEY_ID;
+      const secretAccessKey = process.env.AWS_SECRET || process.env.AWS_SECRET_ACCESS_KEY;
+      if (!!accessKeyId !== !!secretAccessKey) throw new Error('Incomplete mail credentials');
+      const client = new SES({ region: awsConfig.region,
+        requestHandler: { connectionTimeout: 5000, requestTimeout: 10000 }, maxAttempts: 2,
+        ...(accessKeyId ? { credentials: { accessKeyId, secretAccessKey, sessionToken: process.env.AWS_SESSION_TOKEN } } : {}),
+      });
 
       const sendMail = await client.sendEmail(params);
 
       return sendMail;
     } catch (error) {
-      console.log('log: error', error);
-      throw new Error(error);
+      throw new Error('Verification email delivery failed');
     }
   }
 

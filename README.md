@@ -1,5 +1,7 @@
 # Backend - Dark Fantasy
 
+Deployment and mobile integration: see [DEPLOYMENT.md](DEPLOYMENT.md) for the production Docker image, HTTPS proxy, required services, index migration, verification email flow, health checks and private deleted-vault retention.
+
 
 ## 🚀 Setup
 
@@ -136,7 +138,7 @@ Errors return `{ statusCode, error, message }`. `error` is stable: `PHONE_INVALI
 
 ### Mobile session methods
 
-- The Expo app sends `X-Client-Platform: mobile` on every request. Browsers cannot send it, because CORS does not allow the header.
+- The Expo app sends `X-Client-Platform: mobile` on every request. Configured web preview origins can send it too; it is a client claim, not app attestation.
 - With that header, `POST /auth/login` and `POST /auth/signup` return 403 `PHONE_LOGIN_REQUIRED`, and
   Mobile password login uses `/auth/password/login` instead. `JwtStrategy` accepts
   explicitly marked `otp` and `password` sessions. Unmarked legacy mobile sessions are rejected.

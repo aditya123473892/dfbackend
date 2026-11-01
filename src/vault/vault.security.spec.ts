@@ -77,14 +77,33 @@ describe('Vault isolation and durable deletion', () => {
       find: () => ({ limit: () => ({ toArray: async () => row?.state === 'deleting' ? [row] : [] }) }),
       deleteOne: jest.fn(async () => { row = null; }),
     } } };
-    const storage = { deleteOne: jest.fn().mockRejectedValueOnce(new Error('S3 unavailable')).mockResolvedValue(undefined) };
+    const storage = { archiveDeletedVault: jest.fn().mockResolvedValue('deleted/vault/archive.jpg'), deleteOne: jest.fn().mockRejectedValueOnce(new Error('S3 unavailable')).mockResolvedValue(undefined) };
     const photos = { assertActiveAccount: jest.fn(), rate: jest.fn() };
     const service = new VaultService(db as any, storage as any, photos as any);
     await service.remove(owner, id, 1);
     expect(row.state).toBe('deleting'); expect(tombstone.deletedAt).toBeGreaterThan(0);
     await service.cleanup(); expect(row).toBeNull();
+    expect(storage.archiveDeletedVault).toHaveBeenCalledWith(`users/${owner}/vault/${id}.jpg`, owner, id);
     expect(storage.deleteOne).toHaveBeenCalledWith(`users/${owner}/vault/${id}.jpg`);
     expect(storage.deleteOne).toHaveBeenCalledWith(`temp/${owner}/${id}.jpg`);
+  });
+  it('never removes a source if its private deleted-folder archive fails', async () => {
+    const row = { owner, id, _id: 'deleting', state: 'deleting', key: `vault/${owner}/${id}.jpg`, archiveKeys: [`vault/${owner}/${id}.jpg`] };
+    const removeRow = jest.fn();
+    const db: any = { db: { collection: () => ({
+      find: () => ({ limit: () => ({ toArray: async () => [row] }) }), deleteOne: removeRow,
+    }) } };
+    const storage: any = { archiveDeletedVault: jest.fn().mockRejectedValue(new Error('Copy failed')), deleteOne: jest.fn() };
+    await new VaultService(db, storage, {} as any).cleanup();
+    expect(storage.archiveDeletedVault).toHaveBeenCalled();
+    expect(storage.deleteOne).not.toHaveBeenCalled();
+    expect(removeRow).not.toHaveBeenCalled();
+  });
+  it('denies a new download URL immediately after a tombstone is created', async () => {
+    const storage: any = { getSignedURL: jest.fn() };
+    const db: any = { db: { collection: () => ({ findOne: async () => ({ owner, id, deletedAt: 1 }) }) } };
+    await expect(new VaultService(db, storage, { assertActiveAccount() {}, rate() {} } as any).download(owner, id)).rejects.toThrow(NotFoundException);
+    expect(storage.getSignedURL).not.toHaveBeenCalled();
   });
   it('scopes every download lookup to the verified owner and checks the exact vault prefix', async () => {
     const findOne = jest.fn().mockResolvedValue(null);

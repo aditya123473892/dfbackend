@@ -11,6 +11,7 @@ import { Rekognition, DetectModerationLabelsResponse } from '@aws-sdk/client-rek
 import { createPresignedPost } from '@aws-sdk/s3-presigned-post';
 import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
 import { Readable } from 'node:stream';
+import { createHash } from 'node:crypto';
 import sharp = require('sharp');
 import { bucketForKey } from './storage-layout';
 
@@ -105,6 +106,33 @@ export class S3BucketService implements OnModuleInit {
     return value;
   }
   bucketFor(key: string) { return bucketForKey(key, this.bucket); }
+  /** Private, idempotent retention copy; never returned or signed for app users. */
+  async archiveDeletedVault(sourceKey: string, owner: string, id: string) {
+    if (!/^[a-f\d]{24}$/.test(owner) || !/^[a-f\d-]{36}$/.test(id) ||
+        !(sourceKey.startsWith(`vault/${owner}/`) || sourceKey.startsWith(`users/${owner}/vault/${id}/`)) ||
+        sourceKey.includes('..') || !/\.(jpg|mp4|mov)$/.test(sourceKey))
+      throw new BadRequestException('Invalid deleted vault binding');
+    const sourceHash = createHash('sha256').update(sourceKey).digest('hex');
+    const destinationKey = `deleted/vault/${owner}/${id}/${sourceHash}.${sourceKey.split('.').pop()}`;
+    const sourceBucket = this.bucketFor(sourceKey), destinationBucket = this.bucketFor(destinationKey);
+    await Promise.all([this.ensurePrivate(sourceBucket), this.ensurePrivate(destinationBucket)]);
+    const existing = await this.s3.headObject({ Bucket: destinationBucket, Key: destinationKey }).catch(error => {
+      if (error?.$metadata?.httpStatusCode === 404 || ['NotFound', 'NoSuchKey'].includes(error?.name)) return null;
+      throw error;
+    });
+    if (existing?.Metadata?.['source-key-hash'] === sourceHash && existing.ContentLength > 0) return destinationKey;
+    const original = await this.s3.headObject({ Bucket: sourceBucket, Key: sourceKey });
+    if (!original.ETag || !original.ContentLength) throw new ServiceUnavailableException('Vault archive source unavailable');
+    await this.s3.copyObject({ Bucket: destinationBucket, Key: destinationKey,
+      CopySource: `${sourceBucket}/${sourceKey.split('/').map(encodeURIComponent).join('/')}`,
+      CopySourceIfMatch: original.ETag, MetadataDirective: 'REPLACE',
+      Metadata: { 'source-key-hash': sourceHash }, ContentType: original.ContentType,
+      CacheControl: 'private, no-store', ServerSideEncryption: 'AES256' });
+    const archived = await this.s3.headObject({ Bucket: destinationBucket, Key: destinationKey });
+    if (archived.ContentLength !== original.ContentLength || archived.Metadata?.['source-key-hash'] !== sourceHash)
+      throw new ServiceUnavailableException('Vault archive verification failed');
+    return destinationKey;
+  }
   async copyPrivate(sourceKey: string, destinationKey: string) {
     const source = this.bucketFor(sourceKey);
     await Promise.all([this.ensurePrivate(source), this.ensurePrivate(this.bucketFor(destinationKey))]);
@@ -346,6 +374,7 @@ export class S3BucketService implements OnModuleInit {
     });
   }
   async getSignedURL(Key: string, Bucket?: string, expiresInSeconds = 120, noStore = false) {
+    if (Key.startsWith('deleted/')) throw new BadRequestException('Archived objects are not user accessible');
     if (/^reports\//.test(Key || '')) throw new BadRequestException('Evidence cannot be signed by this path');
     if (!Key) return null;
     this.assertBucket(Bucket, Key);

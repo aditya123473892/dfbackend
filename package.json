@@ -9,6 +9,8 @@
   },
   "scripts": {
     "build": "nest build",
+    "postbuild": "node scripts/copy-assets.cjs",
+    "migrate:deploy": "node -r ./dist/src/register-paths.js dist/src/deployment/migrate.js",
     "format": "prettier --write \"src/**/*.ts\" \"test/**/*.ts\"",
     "start": "nest start",
     "dev": "nest start --watch",

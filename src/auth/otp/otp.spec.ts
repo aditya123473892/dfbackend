@@ -79,8 +79,9 @@ describe('Phone OTP authentication', () => {
       Object.assign(byId(id), { phoneE164: phone, phoneVerifiedAt: new Date() });
       return true;
     },
-    create: async (dto: any) => user({ ...dto }),
+    create: async (dto: any) => user({ ...dto, password: await hash(dto.password, 4) }),
     updateOne: async (id: string, fields: any) => Object.assign(byId(id), fields),
+    markEmailVerified: async (id: string) => Object.assign(byId(id), { isEmailVerified: true }),
     findOne: async ({ _id }: any) => byId(_id),
     findById: async (id: string) => byId(id),
     updateLoginInfo: async () => undefined,
@@ -164,6 +165,7 @@ describe('Phone OTP authentication', () => {
     await app.close();
     jest.restoreAllMocks();
     delete process.env.MOBILE_OTP_ONLY_ROUTES;
+    delete process.env.MOBILE_PHONE_AUTH_REQUIRED;
   });
 
   describe('POST /auth/otp/send', () => {
@@ -321,16 +323,19 @@ describe('Phone OTP authentication', () => {
       for (let i = 0; i < 10; i++) await passwordLogin('unknown@example.test', 'wrong').expect(401);
       await passwordLogin('unknown@example.test', 'wrong').expect(429);
     });
-    it('rejects password login and password signup from the mobile app', async () => {
+    it('rejects mobile email signup and password sign-in when phone authentication is enabled', async () => {
+      process.env.MOBILE_PHONE_AUTH_REQUIRED = 'true';
       const owner = user({});
       const login = await request(app.getHttpServer())
         .post('/auth/login').set(MOBILE).send({ username: owner.username, password: 'Correct1pass' }).expect(403);
       expect(login.body.error).toBe('PHONE_LOGIN_REQUIRED');
       expect(login.body.accessToken).toBeUndefined();
       const signup = await request(app.getHttpServer())
-        .post('/auth/signup').set(MOBILE).send({ username: 'new@example.test', password: 'x', firstName: 'a', lastName: 'b', age: 30, gender: 'f', roles: ['user'] })
+        .post('/auth/signup').set(MOBILE).send({ username: 'new@example.test', password: 'x', firstName: 'a', lastName: 'b', age: 30, gender: 'f' })
         .expect(403);
       expect(signup.body.error).toBe('PHONE_LOGIN_REQUIRED');
+      await request(app.getHttpServer()).post('/auth/password/login').set(MOBILE)
+        .send({ identifier: owner.username, password: 'Correct1pass' }).expect(403);
     });
 
     it('leaves web password login unchanged (token marked auth_method "password")', async () => {
@@ -434,6 +439,118 @@ describe('Phone OTP authentication', () => {
 
   describe('new signup', () => {
     const profile = { username: 'new@example.test', password: 'Correct1pass', firstName: 'New', lastName: 'User', age: 30, gender: 'female' };
+
+    it('finishes local signup even when the content-preservation update path is unavailable', async () => {
+      const update = jest.spyOn(usersService, 'updateOne').mockRejectedValue(new Error('Content preservation is busy'));
+      await request(app.getHttpServer()).post('/auth/signup').set(MOBILE)
+        .send({ ...profile, phoneNumber: PHONE }).expect(201);
+      expect(users.find(row => row.username === profile.username)?.isEmailVerified).toBe(true);
+      expect(update).not.toHaveBeenCalled();
+    });
+
+    it('resumes a locally saved, incomplete signup only with its original password', async () => {
+      const incomplete = user({ ...profile, password: passwordHash, isEmailVerified: false, phoneNumber: PHONE });
+      const update = jest.spyOn(usersService, 'updateOne').mockRejectedValue(new Error('Content preservation is busy'));
+      await request(app.getHttpServer()).post('/auth/signup').set(MOBILE)
+        .send({ ...profile, phoneNumber: PHONE, password: 'WrongPass123' }).expect(400);
+      expect(incomplete.isEmailVerified).toBe(false);
+      const retried = await request(app.getHttpServer()).post('/auth/signup').set(MOBILE)
+        .send({ ...profile, phoneNumber: PHONE }).expect(201);
+      expect(retried.body.data.emailVerificationRequired).toBe(false);
+      expect(incomplete.isEmailVerified).toBe(true);
+      expect(users.filter(row => row.username === profile.username)).toHaveLength(1);
+      expect(update).not.toHaveBeenCalled();
+      expect(twilioSend).not.toHaveBeenCalled();
+    });
+
+    it('collects a mobile profile and unverified contact number without OTP, then signs in by email', async () => {
+      const before = {
+        key: process.env.PASSWORD_ENCRYPTION_PRIVATE_KEY,
+        region: process.env.AWS_SES_REGION,
+        sender: process.env.AWS_MAIL_FROM,
+      };
+      process.env.MOBILE_PHONE_AUTH_REQUIRED = 'false';
+      process.env.PASSWORD_ENCRYPTION_PRIVATE_KEY = 'ab'.repeat(32);
+      delete process.env.AWS_SES_REGION;
+      delete process.env.AWS_MAIL_FROM;
+      try {
+        await request(app.getHttpServer()).post('/auth/signup').set(MOBILE)
+          .send(profile).expect(400);
+        await request(app.getHttpServer()).post('/auth/signup').set(MOBILE)
+          .send({ ...profile, phoneNumber: { invalid: true } }).expect(400);
+        await request(app.getHttpServer()).post('/auth/signup').set(MOBILE)
+          .send({ ...profile, phoneNumber: PHONE }).expect(201);
+        const created = users.find(row => row.username === profile.username)!;
+        expect(created).toMatchObject({ firstName: 'New', lastName: 'User', age: 30, gender: 'female', phoneNumber: PHONE, roles: ['user'] });
+        expect(created.phoneE164).toBeUndefined();
+        expect(created.phoneVerifiedAt).toBeUndefined();
+        const login = await request(app.getHttpServer()).post('/auth/password/login').set(MOBILE)
+          .send({ identifier: profile.username, password: profile.password }).expect(201);
+        expect(claims(login.body.data.accessToken)).toMatchObject({ auth_method: 'password' });
+        expect(twilioSend).not.toHaveBeenCalled();
+        expect(twilioCheck).not.toHaveBeenCalled();
+      } finally {
+        for (const [name, value] of Object.entries({ PASSWORD_ENCRYPTION_PRIVATE_KEY: before.key, AWS_SES_REGION: before.region, AWS_MAIL_FROM: before.sender })) {
+          if (value === undefined) delete process.env[name];
+          else process.env[name] = value;
+        }
+      }
+    });
+
+    it('creates a web signup as a regular user without accepting a client role', async () => {
+      const previousKey = process.env.PASSWORD_ENCRYPTION_PRIVATE_KEY;
+      process.env.PASSWORD_ENCRYPTION_PRIVATE_KEY = 'ab'.repeat(32);
+      try {
+        await request(app.getHttpServer()).post('/auth/signup').send(profile).expect(201);
+        expect(users.find((row) => row.username === profile.username)?.roles).toEqual(['user']);
+      } finally {
+        if (previousKey === undefined) delete process.env.PASSWORD_ENCRYPTION_PRIVATE_KEY;
+        else process.env.PASSWORD_ENCRYPTION_PRIVATE_KEY = previousKey;
+      }
+    });
+
+    it.each(['admin', 'moderator', 'root', 'manager'])(
+      'rejects client-supplied %s roles on both public signup routes', async (role) => {
+        const proof = await request(app.getHttpServer()).post('/auth/otp/signup/verify')
+          .send({ phone: PHONE, code: '123456' }).expect(201);
+        for (const route of ['/auth/signup', '/auth/otp/signup']) {
+          const body = route === '/auth/signup'
+            ? profile : { ...profile, signupToken: proof.body.data.signupToken };
+          const response = await request(app.getHttpServer()).post(route)
+            .send({ ...body, roles: [role] }).expect(400);
+          expect(response.body.errors.roles).toBeDefined();
+          expect(users).toHaveLength(0);
+        }
+      },
+    );
+
+    it('delivers a scoped email verification link, refuses a forged link, and verifies before password login', async () => {
+      const keys = ['AWS_SES_REGION', 'AWS_MAIL_FROM', 'PUBLIC_API_URL'];
+      const previous = keys.map(key => process.env[key]);
+      Object.assign(process.env, { AWS_SES_REGION: 'ap-south-1', AWS_MAIL_FROM: 'sender@example.test', PUBLIC_API_URL: 'https://api.example.test' });
+      try {
+        const proof = await request(app.getHttpServer()).post('/auth/otp/signup/verify')
+          .send({ phone: PHONE, code: '123456' }).expect(201);
+        const created = await request(app.getHttpServer()).post('/auth/otp/signup')
+          .send({ ...profile, signupToken: proof.body.data.signupToken }).expect(201);
+        expect(created.body.data.emailVerificationRequired).toBe(true);
+        expect(created.body.data.accessToken).toBeUndefined();
+        await request(app.getHttpServer()).get('/auth/email/verify?token=forged').expect(401);
+        // A verification proof uses the derived scope key, not the session key.
+        const tokens = new ScopedTokens(jwt, new ConfigService({ JWT_SECRET: SECRET }));
+        const row = users.find(u => u.username === profile.username)!;
+        const token = await tokens.sign({ scope: 'email_verification', sub: String(row._id), email: row.username }, 60);
+        await request(app.getHttpServer()).get(`/auth/email/verify?token=${token}`).expect(200);
+        expect(row.isEmailVerified).toBe(true);
+        const login = await request(app.getHttpServer()).post('/auth/password/login').set(MOBILE)
+          .send({ identifier: row.username, password: 'Correct1pass' }).expect(201);
+        expect(claims(login.body.data.accessToken).auth_method).toBe('password');
+        await request(app.getHttpServer()).get('/auth/me').set(MOBILE)
+          .set('Authorization', `Bearer ${token}`).expect(401);
+      } finally {
+        keys.forEach((key, i) => { if (previous[i] === undefined) delete process.env[key]; else process.env[key] = previous[i]; });
+      }
+    });
 
     it('creates an account with only email, password and a verified phone proof', async () => {
       const proof = await request(app.getHttpServer()).post('/auth/otp/signup/verify')

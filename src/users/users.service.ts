@@ -314,6 +314,13 @@ export class UsersService {
     );
   }
 
+  /** Authentication metadata does not change reportable profile content. */
+  async markEmailVerified(id: string): Promise<UsersDocument> {
+    return this.usersModel.findOneAndUpdate(
+      { _id: id }, { $set: { isEmailVerified: true } }, { new: true, runValidators: true },
+    ).exec();
+  }
+
   async updateLoginAttempts(id: string, loginAttempts: number): Promise<any> {
     let update = await this.usersModel.updateOne(
       { _id: id },

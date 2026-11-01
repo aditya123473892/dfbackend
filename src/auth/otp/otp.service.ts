@@ -64,6 +64,8 @@ export class OtpService {
 
   /** Mirrors POST /auth/signup, plus the verified phone. */
   async completeSignup(dto: OtpSignupDto) {
+    const devMail = ['development', 'test'].includes(process.env.NODE_ENV || '') &&
+      (!process.env.AWS_SES_REGION || !process.env.AWS_MAIL_FROM);
     const claims = await this.tokens.verify(dto.signupToken, 'phone_signup');
     if (!claims) throw otpError('SIGNUP_SESSION_INVALID');
     const phone = claims.phone;
@@ -86,7 +88,7 @@ export class OtpService {
         gender: dto.gender,
         phoneNumber: phone,
         roles: [ERole.USER],
-        isEmailVerified: false,
+        isEmailVerified: devMail,
         passwordResetToken: undefined,
         passwordResetTokenUsed: false,
         displayname: `member_${randomUUID().replace(/-/g, '').slice(0, 16)}`,
@@ -100,21 +102,47 @@ export class OtpService {
       throw error;
     }
 
-    const sent = await this.mail.verifyAccount(user.username, user.firstName || 'Member');
-    // Same development behaviour as /auth/signup: no SES, no verification email.
-    if (!process.env.AWS_ACCESS_KEY || !process.env.AWS_SECRET || !process.env.AWS_SES_REGION)
-      await this.users.updateOne(user._id.toString(), { isEmailVerified: true });
+    if (!devMail) await this.deliverVerification(user);
     this.logger.log({ event: 'otp_signup_created', phone: maskPhone(phone) });
 
     const created = await this.users.findByUsername(dto.username);
     if (!created?.isEmailVerified)
       return {
         emailVerificationRequired: true,
-        message: sent
-          ? 'Account created. Verify your email, then sign in with your phone number.'
-          : 'Account created, but the verification email could not be sent. Contact support.',
+        message: 'Account created. Open the verification link in your email, then sign in.',
       };
     return { emailVerificationRequired: false, ...(await this.signIn(created)) };
+  }
+
+  private async deliverVerification(user: any) {
+    const token = await this.tokens.sign({ scope: 'email_verification', sub: String(user._id), email: user.username }, 24 * 60 * 60);
+    const base = process.env.PUBLIC_API_URL || 'http://localhost:9000';
+    const url = `${base.replace(/\/$/, '')}/api/auth/email/verify?token=${encodeURIComponent(token)}`;
+    await this.mail.verifyAccount(user.username, user.firstName || 'Member', url);
+  }
+
+  async verifyEmail(token: string) {
+    if (typeof token !== 'string' || token.length > 2048) throw new UnauthorizedException('Invalid verification link');
+    const claims = await this.tokens.verify(token, 'email_verification');
+    if (!claims) throw new UnauthorizedException('Verification link is invalid or expired');
+    const user = await this.users.findByUsername(claims.email);
+    if (!user || String(user._id) !== claims.sub || user.isBlocked || user.deletionRequestedAt)
+      throw new UnauthorizedException('Account is unavailable');
+    if (!user.isEmailVerified) await this.users.markEmailVerified(claims.sub);
+    return { verified: true };
+  }
+
+  async resendVerification(identifier: string, password: string, ip: string) {
+    const username = identifier.trim().toLowerCase();
+    await this.throttle.consume([
+      { key: throttleKey('email-resend-ip', ip), limit: 10, windowSeconds: TEN_MINUTES },
+      { key: throttleKey('email-resend-user', username), limit: 3, windowSeconds: TEN_MINUTES },
+    ]);
+    await this.auth.validateUser(username, password);
+    const user = await this.users.findByUsername(username);
+    if (!user || user.deletionRequestedAt) throw new UnauthorizedException('Account is unavailable');
+    if (!user.isEmailVerified) await this.deliverVerification(user);
+    return { sent: true };
   }
 
   /** Password sessions remain distinct from OTP sessions for sensitive route guards. */

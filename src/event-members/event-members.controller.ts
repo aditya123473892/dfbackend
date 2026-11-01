@@ -44,8 +44,11 @@ export class EventMembersController {
   })
   async sendJoinRequest(
     @Body() createEventMemberRequestDto: CreateEventMemberRequestDto,
+    @AuthUser() actor: IAuthUser,
   ) {
-    const eventMemeber = await this.eventMembersService.sendJoinRequest(createEventMemberRequestDto);
+    const eventMemeber = await this.eventMembersService.sendJoinRequest({
+      ...createEventMemberRequestDto, user: actor.id, requestStatus: EventRequestStatus.PENDING,
+    });
     return successRes(eventMemeber);
   }
 

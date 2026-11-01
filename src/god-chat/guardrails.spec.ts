@@ -58,7 +58,11 @@ describe('Chat with God guardrails', () => {
       expect(checkInput(text)).toMatchObject({ flags: ['unsafe'], reply: UNSAFE_REPLY });
     });
 
-    it.each(['how do I block someone', 'how do I delete my post', 'what are premium posts?', 'hi'])(
+    it.each(['how do I block someone', 'how do I delete my post', 'what are premium posts?', 'hi',
+      'I want to understand my fantasies without feeling ashamed.',
+      'How can I talk about desires and boundaries with my partner?',
+      'I am curious about consensual roleplay but unsure how to bring it up.',
+    ])(
       'passes ordinary questions like %p',
       (text) => {
         expect(checkInput(text)).toEqual({ content: text, flags: [] });

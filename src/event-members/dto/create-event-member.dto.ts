@@ -8,8 +8,9 @@ export class CreateEventMemberRequestDto {
   event: string;
 
   @ApiProperty()
-  @IsNotEmpty()
-  user: string;
+  @IsOptional()
+  @IsString()
+  user?: string;
 
   @ApiProperty({ enum: EventRequestStatus, default: EventRequestStatus.PENDING })
   @IsEnum(EventRequestStatus)

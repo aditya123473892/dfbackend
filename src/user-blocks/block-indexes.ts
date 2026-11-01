@@ -23,12 +23,25 @@ export async function blockIndexes(
     throw new Error(
       'UserBlocks has duplicate pairs; resolve before applying indexes',
     );
-  await rows.createIndex(
+  const existing = await rows.listIndexes().toArray().catch(error => {
+    if (error?.codeName === 'NamespaceNotFound') return [];
+    throw error;
+  });
+  const ensure = async (key: any, options: any) => {
+    const equivalent = existing.find(index => JSON.stringify(index.key) === JSON.stringify(key));
+    if (equivalent) {
+      if (Boolean(equivalent.unique) !== Boolean(options.unique) || equivalent.partialFilterExpression || equivalent.sparse)
+        throw new Error('UserBlocks has an incompatible index; resolve before applying indexes');
+      return;
+    }
+    await rows.createIndex(key, options);
+  };
+  await ensure(
     { blockerId: 1, blockedId: 1 },
     { unique: true, name: 'block_pair_unique' },
   );
-  await rows.createIndex({ blockedId: 1 }, { name: 'blocked_user' });
-  await rows.createIndex({ blockerId: 1, _id: -1 }, { name: 'block_page' });
+  await ensure({ blockedId: 1 }, { name: 'blocked_user' });
+  await ensure({ blockerId: 1, _id: -1 }, { name: 'block_page' });
   return duplicates;
 }
 
@@ -40,12 +53,13 @@ export async function warnMissingBlockIndexes(
   warn = (message: string) => Logger.warn(message, 'BlockService'),
 ) {
   try {
-    const names = new Set(
-      (await db.db.collection('UserBlocks').listIndexes().toArray()).map(
-        (index) => index.name,
-      ),
-    );
-    const missing = BLOCK_INDEX_NAMES.filter((name) => !names.has(name));
+    const indexes = await db.db.collection('UserBlocks').listIndexes().toArray();
+    const keys = [
+      { blockerId: 1, blockedId: 1 }, { blockedId: 1 }, { blockerId: 1, _id: -1 },
+    ];
+    const missing = BLOCK_INDEX_NAMES.filter((name, position) => !indexes.some(index =>
+      index.name === name || (JSON.stringify(index.key) === JSON.stringify(keys[position]) &&
+        (position !== 0 || index.unique === true))));
     if (missing.length)
       warn(
         `UserBlocks indexes missing (${missing.join(', ')}); every request scans the collection. Run scripts/user-block-indexes.ts --apply.`,

@@ -7,7 +7,7 @@ import { createHmac } from 'crypto';
 export type SignupClaims = { scope: 'phone_signup'; phone: string };
 /** Password sign-in that may only add a phone (existing users on mobile). */
 export type BootstrapClaims = { scope: 'phone_bootstrap'; sub: string };
-type Claims = SignupClaims | BootstrapClaims;
+type Claims = SignupClaims | BootstrapClaims | { scope: 'email_verification'; sub: string; email: string };
 
 export const SIGNUP_TOKEN_SECONDS = 30 * 60;
 export const BOOTSTRAP_TOKEN_SECONDS = 15 * 60;

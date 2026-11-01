@@ -2,6 +2,24 @@ import { SES } from '@aws-sdk/client-ses';
 import { MailService } from './mail.service';
 
 describe('MailService AWS v3', () => {
+  it('renders the email ownership link and uses IAM role credentials', async () => {
+    const keys = ['AWS_ACCESS_KEY', 'AWS_SECRET', 'AWS_ACCESS_KEY_ID', 'AWS_SECRET_ACCESS_KEY', 'AWS_SES_REGION', 'AWS_MAIL_FROM', 'NODE_ENV'];
+    const previous = keys.map(key => process.env[key]);
+    const send = jest.spyOn(SES.prototype, 'sendEmail').mockResolvedValue({ MessageId: 'verification' } as never);
+    const compile = jest.fn(async () => '<a>Verify email</a>');
+    try {
+      keys.forEach(key => delete process.env[key]);
+      Object.assign(process.env, { NODE_ENV: 'production', AWS_SES_REGION: 'ap-south-1', AWS_MAIL_FROM: 'sender@example.test' });
+      await new MailService({ compile } as any).verifyAccount('member@example.test', 'Member', 'https://api.example.test/api/auth/email/verify?token=scoped');
+      expect(compile).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({ url: expect.stringContaining('/api/auth/email/verify?token=') }));
+      expect(send).toHaveBeenCalledTimes(1);
+      delete process.env.AWS_MAIL_FROM;
+      await expect(new MailService({ compile } as any).verifyAccount('member@example.test', 'Member')).rejects.toThrow('delivery failed');
+    } finally {
+      send.mockRestore();
+      keys.forEach((key, i) => { if (previous[i] === undefined) delete process.env[key]; else process.env[key] = previous[i]; });
+    }
+  });
   it('uses the credential provider chain for role deployments and never mocks missing production delivery', async () => {
     const keys = ['AWS_ACCESS_KEY', 'AWS_SECRET', 'AWS_ACCESS_KEY_ID', 'AWS_SECRET_ACCESS_KEY',
       'AWS_SES_REGION', 'AWS_MAIL_FROM', 'NODE_ENV'];

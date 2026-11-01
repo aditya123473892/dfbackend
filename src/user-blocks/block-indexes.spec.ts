@@ -4,6 +4,7 @@ describe('Opt-in UserBlocks indexes', () => {
     const rows = {
       aggregate: jest.fn(() => ({ toArray: async () => duplicates })),
       createIndex: jest.fn(),
+      listIndexes: () => ({ toArray: async () => [] }),
     };
     return { rows, db: { db: { collection: () => rows } } as any };
   };
@@ -13,6 +14,16 @@ describe('Opt-in UserBlocks indexes', () => {
     expect(await blockIndexes(db, false, report)).toEqual([{ count: 2 }]);
     expect(report).toHaveBeenCalled();
     expect(rows.createIndex).not.toHaveBeenCalled();
+  });
+  it('preserves equivalent legacy indexes instead of failing on their names', async () => {
+    const { rows, db } = fixture();
+    rows.listIndexes = () => ({ toArray: async () => [
+      { name: 'blockerId_1_blockedId_1', key: { blockerId: 1, blockedId: 1 }, unique: true },
+      { name: 'blockedId_1', key: { blockedId: 1 } },
+    ] as any });
+    await blockIndexes(db, true, () => {});
+    expect(rows.createIndex).toHaveBeenCalledTimes(1);
+    expect(rows.createIndex).toHaveBeenCalledWith({ blockerId: 1, _id: -1 }, expect.anything());
   });
   it('refuses unsafe unique-index application and creates required indexes only on explicit apply', async () => {
     const bad = fixture([{ count: 2 }]);

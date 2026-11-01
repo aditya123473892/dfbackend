@@ -1,24 +1,24 @@
 import { Body, Controller, Get, Post, Req, UseGuards } from '@nestjs/common';
-import { CreateUserDto } from 'src/users/dtos';
+import { randomUUID } from 'node:crypto';
+import { OtpService } from './otp/otp.service';
 import { toUserResponse } from 'src/users/users.service';
 import {
   ChangePasswordDto,
   ForgotPasswordDto,
   LoginDto,
   ResetPasswordDto,
+  SignupDto,
   VerifyEmailDto,
 } from './dtos';
 import { UsersService } from 'src/users/users.service';
 import { AuthService } from './auth.service';
 import { EBlockedByEnum, ERole } from 'src/common/enums';
-import {
-  badRequestRes,
-  successRes,
-  unAuthorizedRes,
-} from 'src/common/interceptors';
+import { badRequestRes, successRes, unAuthorizedRes } from 'src/common/interceptors';
 import { ApiBearerAuth, ApiTags } from '@nestjs/swagger';
 import { isMobileClient, JwtAuthGuard, RolesGuard } from 'src/common/guards';
 import { otpError } from './otp/otp-errors';
+import { mobilePhoneAuthRequired } from 'src/common/guards/otp-session.guard';
+import { normalizePhone } from './otp/phone';
 import { AuthUser, Roles } from 'src/common/decorators';
 import { IAuthUser } from 'src/common/interfaces';
 import { decrypt, encrypt } from 'src/common/functions';
@@ -33,6 +33,7 @@ export class AuthController {
     private readonly userService: UsersService,
     private readonly mailService: MailService,
     private readonly configService: ConfigService,
+    private readonly otp: OtpService,
   ) {}
 
   @Post('login')
@@ -40,18 +41,14 @@ export class AuthController {
     // Mobile signs in with phone OTP only; existing users use /auth/phone/bootstrap once.
     if (isMobileClient(request)) throw otpError('PHONE_LOGIN_REQUIRED');
 
-    const foundUser = await this.userService.findByUsername(
-      credentials.username,
-    );
+    const foundUser = await this.userService.findByUsername(credentials.username);
 
     if (!foundUser) {
       return badRequestRes('Account does not exist with this email!');
     }
 
     if (!foundUser.isEmailVerified) {
-      return badRequestRes(
-        `Your account isn't verified yet, Please check your email.`,
-      );
+      return badRequestRes(`Your account isn't verified yet, Please check your email.`);
     }
 
     // Check if user is blocked
@@ -64,10 +61,7 @@ export class AuthController {
       return badRequestRes(message);
     }
 
-    let user = await this.authService.validateUser(
-      credentials.username,
-      credentials.password,
-    );
+    let user = await this.authService.validateUser(credentials.username, credentials.password);
 
     //Login Failed
     if (!user) {
@@ -76,10 +70,7 @@ export class AuthController {
       if (user.loginAttempts === 2) {
         await this.userService.blockUserBySystem(user._id);
       } else {
-        await this.userService.updateLoginAttempts(
-          user._id,
-          user.loginAttempts + 1,
-        );
+        await this.userService.updateLoginAttempts(user._id, user.loginAttempts + 1);
       }
 
       return badRequestRes('Invalid username or password');
@@ -88,8 +79,7 @@ export class AuthController {
     // Create Token
     // The response presenter may expose self-only fields only after authentication.
     if (request) request.user = { id: String(user._id) };
-    const { accessToken, cookieToken } =
-      await this.authService.createTokens(user);
+    const { accessToken, cookieToken } = await this.authService.createTokens(user);
 
     // increment login count update last login IP check login IP
     await this.userService.updateLoginInfo(user._id);
@@ -103,81 +93,99 @@ export class AuthController {
   }
 
   @Post('signup')
-  async signUp(@Body() createUserDto: CreateUserDto, @Req() request?: any) {
-    // Mobile signups verify the phone first: /auth/otp/signup/verify then /auth/otp/signup.
-    if (isMobileClient(request)) throw otpError('PHONE_LOGIN_REQUIRED');
-    try {
-      const foundUser = await this.userService.findByUsername(
-        createUserDto.username,
-      );
-
-      if (foundUser) {
-        return badRequestRes(
-          'Account already exists with this email!, go to login',
-        );
-      }
-
-      // extract display name from username
-
-      const displayname = createUserDto.username.split('@')[0];
-
-      // Create user
-      const user = await this.userService.create({
-        username: createUserDto.username,
-        password: createUserDto.password,
-        firstName: createUserDto.firstName,
-        lastName: createUserDto.lastName,
-        age: createUserDto.age,
-        gender: createUserDto.gender,
-        phoneNumber: createUserDto.phoneNumber,
-        roles: [ERole.USER],
-        isEmailVerified: false,
-        passwordResetToken: undefined,
-        passwordResetTokenUsed: false,
-        displayname,
+  async signUp(@Body() createUserDto: SignupDto, @Req() request?: any) {
+    if (isMobileClient(request) && mobilePhoneAuthRequired())
+      throw otpError('PHONE_LOGIN_REQUIRED');
+    createUserDto.username = createUserDto.username.trim().toLowerCase();
+    const contact = createUserDto.phoneNumber
+      ? normalizePhone(createUserDto.phoneNumber)
+      : undefined;
+    if ((isMobileClient(request) || createUserDto.phoneNumber) && !contact)
+      throw otpError('PHONE_INVALID');
+    const localSignup =
+      ['development', 'test'].includes(process.env.NODE_ENV || '') &&
+      (!process.env.AWS_SES_REGION || !process.env.AWS_MAIL_FROM);
+    const completed = () =>
+      successRes({
+        emailVerificationRequired: !localSignup,
+        message: localSignup
+          ? 'Account created. Sign in with your email and password.'
+          : 'Account created. Check your email to verify your account.',
       });
+    const foundUser = await this.userService.findByUsername(createUserDto.username);
 
-      if (!user) badRequestRes('Failed to signup!');
-
-      // Generate email verification token valid for 3 days
-      const currentDate = new Date();
-      const expiryDate = new Date(currentDate);
-      expiryDate.setDate(currentDate.getDate() + 3);
-
-      const payload = `${user.username}_${expiryDate.toISOString()}`;
-
-      const token = await encrypt(
-        payload,
-        process.env.PASSWORD_ENCRYPTION_PRIVATE_KEY,
-      );
-
-      // const url = `${process.env.PUBLIC_SITE_DOMAIN}/verify-email?token=${token}`;
-
-      //TODO: Send email here
-      const sendEmail = await this.mailService.verifyAccount(
-        user.username,
-        user.firstName,
-        // url,
-      );
-      // Mock email verification in development
-      if (
-        !process.env.AWS_ACCESS_KEY ||
-        !process.env.AWS_SECRET ||
-        !process.env.AWS_SES_REGION
-      ) {
-        await this.userService.updateOne(user._id.toString(), {
-          isEmailVerified: true,
-        });
+    if (foundUser) {
+      // A previous attempt may have saved the account before its final update
+      // failed. Resume only after a rate-limited password check, never by email alone.
+      if (localSignup && !foundUser.isEmailVerified) {
+        try {
+          await this.otp.resendVerification(
+            createUserDto.username,
+            createUserDto.password,
+            request?.ip || request?.socket?.remoteAddress || 'unknown',
+          );
+        } catch (error) {
+          if (error?.getStatus?.() !== 401) throw error;
+          return badRequestRes(
+            'Account already exists with this email!, go to login',
+            null,
+            'EMAIL_IN_USE',
+          );
+        }
+        await this.userService.markEmailVerified(String(foundUser._id));
+        return completed();
       }
-
-      if (!sendEmail) return badRequestRes(`Unable to verification email`);
-
-      return successRes({
-        message: 'Account created, Please check your email and verify!',
-      });
-    } catch (error) {
-      throw new Error(error);
+      return badRequestRes('Account already exists with this email!, go to login');
     }
+
+    // extract display name from username
+
+    const displayname = isMobileClient(request)
+      ? `member_${randomUUID().replace(/-/g, '').slice(0, 16)}`
+      : createUserDto.username.split('@')[0];
+
+    // Create user
+    const user = await this.userService.create({
+      username: createUserDto.username,
+      password: createUserDto.password,
+      firstName: createUserDto.firstName,
+      lastName: createUserDto.lastName,
+      age: createUserDto.age,
+      gender: createUserDto.gender,
+      // Contact details alone are not proof of phone ownership.
+      phoneNumber: contact,
+      roles: [ERole.USER],
+      // Authentication metadata is written atomically at creation. It must not
+      // wait on the unrelated content-preservation mutation lock.
+      isEmailVerified: localSignup,
+      passwordResetToken: undefined,
+      passwordResetTokenUsed: false,
+      displayname,
+    });
+
+    if (!user) return badRequestRes('Failed to signup!');
+    if (localSignup) return completed();
+
+    // Generate email verification token valid for 3 days
+    const currentDate = new Date();
+    const expiryDate = new Date(currentDate);
+    expiryDate.setDate(currentDate.getDate() + 3);
+
+    const payload = `${user.username}_${expiryDate.toISOString()}`;
+
+    const token = await encrypt(payload, process.env.PASSWORD_ENCRYPTION_PRIVATE_KEY);
+
+    // const url = `${process.env.PUBLIC_SITE_DOMAIN}/verify-email?token=${token}`;
+
+    //TODO: Send email here
+    const sendEmail = await this.mailService.verifyAccount(
+      user.username,
+      user.firstName,
+      // url,
+    );
+    if (!sendEmail) return badRequestRes(`Unable to verification email`);
+
+    return completed();
   }
 
   @Post('verify-email')
@@ -199,17 +207,11 @@ export class AuthController {
 
       const foundUser = await this.userService.findByUsername(username);
 
-      if (!foundUser)
-        return badRequestRes('User not found!', null, 'UserNotFound');
+      if (!foundUser) return badRequestRes('User not found!', null, 'UserNotFound');
 
       if (foundUser.isEmailVerified) return successRes('Email verified!');
 
-      const updatedUser = await this.userService.updateOne(
-        foundUser._id.toString(),
-        {
-          isEmailVerified: true,
-        },
-      );
+      const updatedUser = await this.userService.markEmailVerified(foundUser._id.toString());
 
       return updatedUser.isEmailVerified
         ? successRes('Email verified successfully!')
@@ -223,9 +225,11 @@ export class AuthController {
   async forgotPassword(@Body() { username }: ForgotPasswordDto) {
     const user = await this.userService.findOne({ username });
 
-    const accepted = () => successRes(
-      { passwordRequest: true }, 'If an account exists, reset instructions have been sent.',
-    );
+    const accepted = () =>
+      successRes(
+        { passwordRequest: true },
+        'If an account exists, reset instructions have been sent.',
+      );
     if (!user || user.isBlocked || user.deletionRequestedAt) return accepted();
 
     //TODO: Generate a token for user with expiry
@@ -254,11 +258,7 @@ export class AuthController {
     const url = `${process.env.PUBLIC_SITE_DOMAIN}/reset-password?token=${token}`;
 
     // Send email here
-    const SendEmail = await this.mailService.resetPassword(
-      user.username,
-      user.firstName,
-      url,
-    );
+    const SendEmail = await this.mailService.resetPassword(user.username, user.firstName, url);
 
     if (!SendEmail) return badRequestRes(`Unable to send link`);
 
@@ -277,10 +277,7 @@ export class AuthController {
 
       const user = await this.userService.findOne({ username });
 
-      if (!user)
-        return badRequestRes(
-          `No user exist with this '${username}' username or email!`,
-        );
+      if (!user) return badRequestRes(`No user exist with this '${username}' username or email!`);
 
       if (user.passwordResetToken !== token)
         return badRequestRes(`Invalid auth token`, {
@@ -290,21 +287,13 @@ export class AuthController {
       if (user.isBlocked) return badRequestRes(`Account blocked!`);
 
       if (new Date(expiryDate) < new Date())
-        return badRequestRes(
-          `Your password request token is expired, Please try again!`,
-        );
+        return badRequestRes(`Your password request token is expired, Please try again!`);
 
-      const updateUser = await this.userService.updatePassword(
-        user.id,
-        password,
-      );
+      const updateUser = await this.userService.updatePassword(user.id, password);
 
       if (!updateUser) return badRequestRes(`Unable to update user password`);
 
-      return successRes(
-        { resetPassword: true },
-        'Password updated successfully',
-      );
+      return successRes({ resetPassword: true }, 'Password updated successfully');
     } catch (error) {
       throw new Error('Invalid Token');
     }
@@ -329,17 +318,13 @@ export class AuthController {
 
       const foundUser = await this.userService.findByUsername(username);
 
-      if (!foundUser)
-        return badRequestRes('User not found!', null, 'UserNotFound');
+      if (!foundUser) return badRequestRes('User not found!', null, 'UserNotFound');
 
       if (foundUser.isEmailVerified) return successRes('Email verified!');
 
-      const updatedUser = await this.userService.updateOne(
-        foundUser._id.toString(),
-        {
-          isEmailVerified: true,
-        },
-      );
+      const updatedUser = await this.userService.updateOne(foundUser._id.toString(), {
+        isEmailVerified: true,
+      });
 
       return updatedUser.isEmailVerified
         ? successRes('Email verified successfully!')
@@ -366,8 +351,7 @@ export class AuthController {
       changePasswordDto.oldPassword,
     );
 
-    if (!user)
-      return badRequestRes('Incorrect old password!, Please try again');
+    if (!user) return badRequestRes('Incorrect old password!, Please try again');
 
     const updatedUser = await this.userService.updatePassword(
       authUser.id,
@@ -397,9 +381,7 @@ export class AuthController {
     if (!user) return unAuthorizedRes('Unauthrorised! Please login');
 
     if (user.isBlocked)
-      return unAuthorizedRes(
-        'Account blocked!, contact administrator Dark Fantasy',
-      );
+      return unAuthorizedRes('Account blocked!, contact administrator Dark Fantasy');
 
     return successRes(toUserResponse(user, auth));
   }
