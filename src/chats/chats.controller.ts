@@ -107,6 +107,19 @@ export class ChatsController {
     return successGetRes(result);
   }
 
+  @Post('messages/:messageId/media/:mediaId/preview')
+  @Header('Cache-Control', 'private, no-store')
+  @Header('Pragma', 'no-cache')
+  async previewOwnPhoto(
+    @AuthUser() user: IAuthUser,
+    @Param('messageId') messageId: string,
+    @Param('mediaId') mediaId: string,
+  ) {
+    return successGetRes(
+      await this.chatService.previewOwnRestrictedPhoto(user.id, messageId, mediaId),
+    );
+  }
+
   @Patch('messages/:messageId/media/:mediaId/revoke')
   async revokeMedia(
     @AuthUser() user: IAuthUser,

@@ -13,6 +13,7 @@ export enum ChatMediaAuditAction {
   EXPIRED = 'media_expired',
   DELETED = 'media_deleted',
   VIEW_ONCE_OPENED = 'media_view_once_opened',
+  SENDER_PREVIEWED = 'media_sender_previewed',
 }
 
 @Schema({ timestamps: true, collection: 'ChatMediaAudits' })

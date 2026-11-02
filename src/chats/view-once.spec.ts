@@ -238,6 +238,31 @@ describe('View-once photo sharing', () => {
     expect(photos.readChatPhoto).not.toHaveBeenCalled();
   });
 
+  it('lets the sender preview an unopened photo without using the opening', async () => {
+    const { service, model, photos } = harness();
+    for (let i = 0; i < 2; i++)
+      await expect(
+        service.previewOwnRestrictedPhoto(sender, messageId, mediaId),
+      ).resolves.toEqual({ dataUri: 'data:image/jpeg;base64,/9j/' });
+    expect(photos.readChatPhoto).toHaveBeenCalledTimes(2);
+    expect(model.findOneAndUpdate).not.toHaveBeenCalled();
+    await expect(
+      service.openRestrictedPhoto(receiver, messageId, mediaId),
+    ).resolves.toHaveProperty('dataUri');
+  });
+
+  it('keeps the sender preview for the sender, and ends it once the photo is opened', async () => {
+    const { service, photos } = harness();
+    await expect(
+      service.previewOwnRestrictedPhoto(receiver, messageId, mediaId),
+    ).rejects.toBeInstanceOf(ForbiddenException);
+    await service.openRestrictedPhoto(receiver, messageId, mediaId);
+    await expect(
+      service.previewOwnRestrictedPhoto(sender, messageId, mediaId),
+    ).rejects.toBeInstanceOf(GoneException);
+    expect(photos.readChatPhoto).toHaveBeenCalledTimes(1);
+  });
+
   it('keeps unlimited photos accessible on repeated opens', async () => {
     const { service, model, photos } = harness(false);
     await service.getMediaAccessUrl(receiver, messageId, mediaId);

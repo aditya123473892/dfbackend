@@ -787,6 +787,54 @@ export class ChatService {
     };
   }
 
+  /**
+   * Lets the sender look at their own restricted photo while it is still unopened.
+   * It never claims the recipient's single opening; once that happens the photo is
+   * gone for the sender too.
+   */
+  async previewOwnRestrictedPhoto(
+    actorId: string,
+    messageId: string,
+    mediaId: string,
+  ) {
+    const message = await this.findAuthorizedMessage(messageId, actorId, true);
+    if (!message.viewOnce && !message.viewDurationSeconds)
+      throw new BadRequestException('This photo has unlimited views');
+    if (String(message.sender) !== actorId)
+      throw new ForbiddenException('Only the sender can preview this photo');
+    const media = ((message as any).media || []).find(
+      (item, index) => this.mediaPublicId(message, item, index) === mediaId,
+    );
+    if (
+      message.viewedAt ||
+      !media ||
+      (media.status && media.status !== ChatMediaStatus.ACTIVE) ||
+      (media.expiresAt && new Date(media.expiresAt) <= new Date())
+    )
+      throw new GoneException('Photo opened or expired');
+    if (media.mimetype !== 'image/jpeg')
+      throw new BadRequestException('Only photos are supported');
+    const key = media.storageKey || media.filename;
+    if (!key) throw new NotFoundException('Photo not found');
+    const bytes = await this.photos.readChatPhoto(key, {
+      ownerId: String(message.sender),
+      resourceType: 'chat',
+      resourceId: String(message._id),
+      requester: actorId,
+      messageId: String(message._id),
+      conversationId: createHash('sha256')
+        .update(
+          message.groupId
+            ? `group:${message.groupId}`
+            : `direct:${[String(message.sender), String(message.receiver)].sort().join('-')}`,
+        )
+        .digest('hex')
+        .slice(0, 32),
+    });
+    await this.audit(actorId, ChatMediaAuditAction.SENDER_PREVIEWED, message, media);
+    return { dataUri: `data:image/jpeg;base64,${bytes.toString('base64')}` };
+  }
+
   async revokeMedia(actorId: string, messageId: string, mediaId: string) {
     return preserveMutation(this.chatMessageModel.db, [`ChatMessages:${messageId}`], () => this.revokeUnheldMedia(actorId, messageId, mediaId), () => this.findOwnedMessage(messageId, actorId, true));
   }
