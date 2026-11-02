@@ -44,3 +44,6 @@ config.bat
 !.env.example
 !package-lock.json
 !.env.production.example
+
+# Local development database (npm run db:local)
+.local-mongo/
