@@ -53,17 +53,21 @@ describe('Premium HTTP response pipeline', () => {
     keyFromReference: (value?: string) => value,
     getSignedURL: jest.fn(async () => `https://s3.test/${key}?X-Amz-Signature=secret`),
   };
+  const findOne = (name: string) => async (filter: any) => {
+    if (name === 'Posts') return String(filter._id) === postId ? post : null;
+    if (name === 'Users') {
+      const id = String(filter._id);
+      return [owner, viewerId].includes(id) ? { _id: new Types.ObjectId(id), premiumUntil: id === viewer.id ? viewer.premiumUntil : null } : null;
+    }
+    if (name === 'UserBlocks') return blocked ? {} : null;
+    if (name === 'PhotoUploads') return { _id: photoId, owner, key, ref: `post:${postId}`, state: 'attached' };
+    return null;
+  };
   const db: any = { db: { collection: (name: string) => ({
-    findOne: async (filter: any) => {
-      if (name === 'Posts') return String(filter._id) === postId ? post : null;
-      if (name === 'Users') {
-        const id = String(filter._id);
-        return [owner, viewerId].includes(id) ? { _id: new Types.ObjectId(id), premiumUntil: id === viewer.id ? viewer.premiumUntil : null } : null;
-      }
-      if (name === 'UserBlocks') return blocked ? {} : null;
-      if (name === 'PhotoUploads') return { _id: photoId, owner, key, ref: `post:${postId}`, state: 'attached' };
-      return null;
-    },
+    findOne: findOne(name),
+    // Batched response lookups: the same rows as findOne, by `_id: { $in }`.
+    find: (filter: any) => ({ toArray: async () => filter._id?.$in
+      ? (await Promise.all(filter._id.$in.map((_id: any) => findOne(name)({ _id })))).filter(Boolean) : [] }),
   }) } };
 
   beforeAll(async () => {

@@ -53,7 +53,7 @@ describe('Checkpoint 1 resource binding', () => {
         const row = canonical ? { ownerId: owner, resourceType: 'post', resourceId, s3Key: key, state: 'attached' } : { owner, ref: `post:${resourceId}`, key, state: 'attached' };
         const { service, storage } = harness(row);
         await expect(service.accessUrl(key, 120, context)).resolves.toBe('https://signed.test/image');
-        expect(storage.getSignedURL).toHaveBeenCalledWith(key, undefined, 120, true);
+        expect(storage.getSignedURL).toHaveBeenCalledWith(key, undefined, 120, false);
         await expect(service.accessUrl(key, 120, { ...context, resourceId: 'other' })).rejects.toThrow(NotFoundException);
         await expect(service.accessUrl(key, 120, { ...context, ownerId: 'other' })).rejects.toThrow(NotFoundException);
       }

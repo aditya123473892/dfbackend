@@ -23,6 +23,32 @@ export async function recordReportAccess(
     { upsert: true, session },
   );
 }
+/** The same receipts as recordReportAccess for everything one response showed, in one write. */
+export async function recordReportAccessMany(
+  db: Connection,
+  viewerId: string,
+  resources: { collection: string; id: string }[],
+) {
+  if (!db?.getClient || !Types.ObjectId.isValid(viewerId)) return;
+  const now = new Date();
+  const operations = resources
+    .filter(({ collection }) => ['Users', 'Posts', 'Events'].includes(collection))
+    .map(({ collection, id }) => {
+      const resource = `${collection}:${id}`;
+      return {
+        updateOne: {
+          filter: { _id: `${viewerId}:${resource}` },
+          update: {
+            $setOnInsert: { viewerId, resource, firstSeenAt: now },
+            $set: { lastSeenAt: now },
+          },
+          upsert: true,
+        },
+      };
+    });
+  if (operations.length)
+    await db.db.collection<any>('ReportAccess').bulkWrite(operations, { ordered: false });
+}
 /** Internal-only reader. No controller/provider export, no signing/history calls,
  * no Mongoose queries and no caller-supplied owner/conversation/authorization. */
 export async function readReportSource(
