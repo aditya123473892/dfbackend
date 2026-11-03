@@ -16,14 +16,14 @@ const segment = (value: string) => {
 };
 
 /** Allocate once, persist before writing, and reuse on retry. No filename/path parameter. */
-export function allocateKey(context: ResourceContext, variant?: 1080 | 320) {
+export function allocateKey(context: ResourceContext, variant?: 1080 | 480 | 320) {
   const objectId = randomUUID();
   return { objectId, key: buildKey(context, objectId, variant) };
 }
-export function buildKey(context: ResourceContext, objectId: string, variant?: 1080 | 320) {
+export function buildKey(context: ResourceContext, objectId: string, variant?: 1080 | 480 | 320) {
   if (!/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(objectId))
     throw new Error('Object identifier must be a backend UUID');
-  if (variant !== undefined && variant !== 1080 && variant !== 320) throw new Error('Invalid variant');
+  if (variant !== undefined && variant !== 1080 && variant !== 480 && variant !== 320) throw new Error('Invalid variant');
   if (variant !== undefined && (['vault', 'chat', 'temp'].includes(context.resourceType) || context.resourceType === 'group' && variant !== 320))
     throw new Error('Variant does not belong to this resource type');
   const owner = segment(context.ownerId), resource = segment(context.resourceId);

@@ -72,10 +72,15 @@ describe('ChatGateway authentication and identity', () => {
     photos.assertActiveAccount.mockRejectedValue(
       new Error('Account unavailable'),
     );
+    // Within 15s of the last check the database result is reused (the JWT is
+    // still verified); suspension and deletion also disconnect immediately.
     const next = jest.fn();
     await client.use.mock.calls[0][0]([], next);
+    expect(next).toHaveBeenCalledTimes(1);
+    client.data.accountCheckedAt = Date.now() - 15_001;
+    await client.use.mock.calls[0][0]([], next);
     expect(client.disconnect).toHaveBeenCalledWith(true);
-    expect(next).not.toHaveBeenCalled();
+    expect(next).toHaveBeenCalledTimes(1);
   });
 
   it('disconnects the account room when account deletion is requested', () => {

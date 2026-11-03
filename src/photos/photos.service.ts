@@ -25,6 +25,7 @@ import { Subject } from 'rxjs';
 import { S3BucketService } from '../s3-bucket/s3-bucket.service';
 import { MediaService, originalUrlSeconds } from './media.service';
 import { MAX_IMAGES_PER_RESOURCE, POST_MAX_IMAGES } from './photo.dto';
+import sharp = require('sharp');
 import { PostMapper, isMappedPostImage, isPremium } from '../posts/post.mapper';
 
 /** Confirms processed at once per instance; most of each is S3 and moderation I/O, not CPU. */
@@ -32,6 +33,19 @@ function processingLimit() {
   const limit = Number(process.env.PHOTO_PROCESSING_CONCURRENCY || 6);
   return Number.isInteger(limit) && limit >= 1 && limit <= 32 ? limit : 6;
 }
+
+/** The collection whose RestrictedContent entry hides each resource type. */
+const RESTRICTION_COLLECTIONS: Record<string, string> = {
+  profile: 'Users', post: 'Posts', event: 'Events', group: 'Groups', chat: 'ChatMessages',
+};
+
+/** Grid-sized copies: at least this many pixels on the shorter side. */
+const THUMB_SIZE = 480;
+/** Attached photos given a thumbnail per cleanup run (new ones are made at attach). */
+const THUMB_BACKFILL = 10;
+const THUMB_ATTEMPTS = 3;
+/** Resource types whose photos are shown in grids. */
+const THUMB_TYPES = ['post', 'profile'];
 
 /** Response resources by collection, in lookup precedence order. */
 const CONTEXT_SOURCES = [
@@ -47,6 +61,9 @@ type PresentScope = {
   contexts: Map<string, Promise<ResourceContext | undefined>>;
   posts: Map<string, any>;
   liked: Set<string>;
+  /** RestrictedContent IDs already read for this response, and those that exist. */
+  restrictionsRead: Set<string>;
+  restricted: Set<string>;
   memo: Map<string, Promise<unknown>>;
   batch?: { ids: string[]; done: Promise<Map<string, ResourceContext>> };
 };
@@ -350,14 +367,61 @@ export class PhotosService implements OnModuleInit {
       });
       if (sourceKey !== destination) await this.enqueue([sourceKey], new Date(Date.now() + 600000), true);
     }
+    if (THUMB_TYPES.includes(context.resourceType))
+      for (const id of ids) void this.buildThumbnail(id).catch(() => undefined);
     return media;
+  }
+
+  /**
+   * A small WebP copy of one attached grid photo, stored beside the original
+   * (`.../<object>/480.webp`) and recorded as `thumbKey`. Clients fall back to
+   * the original until it exists. Claimed with a lease so one process builds it.
+   */
+  async buildThumbnail(photoId: string) {
+    const now = new Date();
+    const photo = await this.uploads.findOneAndUpdate(
+      {
+        _id: photoId, state: 'attached', resourceType: { $in: THUMB_TYPES },
+        thumbKey: { $exists: false }, thumbUnavailable: { $ne: true },
+        $or: [{ thumbLeaseUntil: { $exists: false } }, { thumbLeaseUntil: { $lt: now } }],
+      },
+      { $set: { thumbLeaseUntil: new Date(Date.now() + 120000) } },
+    );
+    if (!photo) return;
+    const source = storedKey(photo);
+    // Legacy layouts have no variant slot beside the original.
+    if (!source || !/\/[0-9a-f-]{36}\/original\.jpg$/.test(source)) {
+      await this.uploads.updateOne({ _id: photoId }, { $set: { thumbUnavailable: true }, $unset: { thumbLeaseUntil: '' } });
+      return;
+    }
+    const thumbKey = source.replace(/original\.jpg$/, `${THUMB_SIZE}.webp`);
+    try {
+      // Deleted by the cleanup job unless a live row references it by then.
+      await this.enqueue([thumbKey], new Date(Date.now() + 600000), true);
+      const bytes = await this.storage.readVerified(source, 'image/jpeg');
+      const thumb = await sharp(bytes)
+        .resize({ width: THUMB_SIZE, height: THUMB_SIZE, fit: 'outside', withoutEnlargement: true })
+        .webp({ quality: 72 })
+        .toBuffer();
+      await this.storage.putApproved(thumbKey, thumb, 'image/webp');
+      await this.uploads.updateOne(
+        { _id: photoId, state: 'attached', $or: [{ s3Key: source }, { key: source }] },
+        { $set: { thumbKey }, $unset: { thumbLeaseUntil: '', thumbAttempts: '' } },
+      );
+    } catch {
+      const attempts = (photo.thumbAttempts || 0) + 1;
+      await this.uploads.updateOne({ _id: photoId }, {
+        $set: { thumbAttempts: attempts, ...(attempts >= THUMB_ATTEMPTS ? { thumbUnavailable: true } : {}) },
+        $unset: { thumbLeaseUntil: '' },
+      });
+    }
   }
   async release(owner: string, ref: string, keep: string[] = []) {
     const old = await this.uploads
       .find({ owner, ref, state: 'attached', key: { $nin: keep } })
       .toArray();
     // Persist jobs before marking records. Retries are idempotent.
-    await this.enqueue(old.flatMap((item) => [item.key, item.previewKey]));
+    await this.enqueue(old.flatMap((item) => [item.key, item.previewKey, item.thumbKey]));
     await this.uploads.updateMany(
       { owner, ref, state: 'attached', key: { $nin: keep } },
       { $set: { state: 'deleting', status: 'deleting' } },
@@ -365,7 +429,7 @@ export class PhotosService implements OnModuleInit {
   }
   async retire(ref: string, keys: string[]) {
     const photos = await this.uploads.find({ ref, key: { $in: keys } }).toArray();
-    await this.enqueue(photos.map((photo) => photo.previewKey));
+    await this.enqueue(photos.flatMap((photo) => [photo.previewKey, photo.thumbKey]));
     await this.enqueue(keys);
     await this.uploads.updateMany(
       { ref, key: { $in: keys } },
@@ -410,7 +474,7 @@ export class PhotosService implements OnModuleInit {
     if (!changed.matchedCount)
       throw new ConflictException('Photo is already in use');
     await this.enqueue(
-      [photo.key, photo.tempKey, photo.previewKey, photo.previewProcessingKey],
+      [photo.key, photo.tempKey, photo.previewKey, photo.previewProcessingKey, photo.thumbKey],
       new Date(Math.max(Date.now(), photo.expiresAt.getTime()) + 60000),
     );
   }
@@ -436,7 +500,10 @@ export class PhotosService implements OnModuleInit {
     scope?: PresentScope): Promise<any> {
     if (!value || typeof value !== 'object') return value;
     if (!scope) {
-      scope = { contexts: new Map(), posts: new Map(), liked: new Set(), memo: new Map() };
+      scope = {
+        contexts: new Map(), posts: new Map(), liked: new Set(),
+        restrictionsRead: new Set(), restricted: new Set(), memo: new Map(),
+      };
       // Resolve every resource in the response in one batch before walking it.
       for (const id of resourceIds(value)) this.contextFor(id, requester, scope);
     }
@@ -484,6 +551,15 @@ export class PhotosService implements OnModuleInit {
               throw error;
             }
           },
+          thumbnail: async image => {
+            const key = this.storage.keyFromReference(image.storageKey || image.s3Key || image.filename || image.url);
+            if (!key) return '';
+            try { return await this.accessUrl(key, originalUrlSeconds(), context, adminPosts, scope, 'thumbnail'); }
+            catch (error) {
+              if (error instanceof NotFoundException || error instanceof ForbiddenException) return '';
+              throw error;
+            }
+          },
           preview: key => new MediaService(this.storage).previewUrl(key),
           video: async (video) => {
             try { return await this.videoAccessUrl(String(video.storageKey || ''), context, adminPosts, scope); }
@@ -503,6 +579,9 @@ export class PhotosService implements OnModuleInit {
       if (['avatar', 'groupIcon'].includes(field)) {
         const expected = field === 'avatar' ? 'profile' : 'group';
         result[field] = context?.resourceType === expected ? await this.displayUrl(String(item || ''), context, scope) : '';
+        // Grid-sized profile photo; '' until one exists.
+        if (field === 'avatar' && expected === context?.resourceType)
+          result.avatarThumbnail = await this.displayUrl(String(item || ''), context, scope, 'thumbnail');
       } else result[field] = await this.present(item, requester, context, adminPosts, scope);
     }
     const key = source.storageKey || source.filename;
@@ -552,6 +631,15 @@ export class PhotosService implements OnModuleInit {
         seen.push({ collection, id });
       }
     });
+    // Every restriction the pair checks below would read, in one query.
+    if (this.db?.getClient && contexts.size) {
+      const keys = [...new Set([...contexts.values()].flatMap(context =>
+        [`${RESTRICTION_COLLECTIONS[context.resourceType]}:${context.resourceId}`, `Users:${context.ownerId}`]))];
+      const rows = await this.db.db.collection('RestrictedContent')
+        .find({ _id: { $in: keys } } as any, { projection: { _id: 1 } }).toArray();
+      for (const key of keys) scope.restrictionsRead.add(key);
+      for (const row of rows) scope.restricted.add(String(row._id));
+    }
     // Prior-access receipts let a viewer report content later hidden from them;
     // one write per batch, kept off the response path.
     if (requester && seen.length)
@@ -579,29 +667,33 @@ export class PhotosService implements OnModuleInit {
   private premiumAccess(context: ResourceContext, adminPost: boolean, scope?: PresentScope) {
     return this.once(scope, `premium:${adminPost}:${JSON.stringify(context)}`, () => this.assertPremiumAccess(context, adminPost, scope));
   }
-  async displayUrl(reference: string, context: ResourceContext, scope?: PresentScope) {
+  async displayUrl(reference: string, context: ResourceContext, scope?: PresentScope, variant?: 'thumbnail') {
     if (!reference || !context || ['vault', 'chat', 'temp'].includes(context.resourceType)) return '';
     const key = this.storage.keyFromReference(reference);
     if (!key) return '';
-    try { return await this.accessUrl(key, 120, context, false, scope); }
+    try { return await this.accessUrl(key, 120, context, false, scope, variant); }
     catch (error) { if (error instanceof NotFoundException || error instanceof ForbiddenException) return ''; throw error; }
   }
-  async accessUrl(key: string, seconds: number, context: ResourceContext, adminPost = false, scope?: PresentScope) {
+  /** `variant: 'thumbnail'` authorizes `key` (the original) exactly the same and signs its grid copy. */
+  async accessUrl(key: string, seconds: number, context: ResourceContext, adminPost = false, scope?: PresentScope,
+    variant?: 'thumbnail') {
     if (!context || context.resourceType === 'vault' || context.resourceType === 'temp' || key.includes('/vault/') || key.startsWith('vault/'))
       throw new NotFoundException('Photo not available');
     // An avatar repeated on every post of a page is checked and signed once.
-    return this.once(scope, `url:${seconds}:${adminPost}:${key}:${JSON.stringify(context)}`, async () => {
-      const photo = await this.uploads.findOne({
+    return this.once(scope, `url:${variant ?? 'original'}:${seconds}:${adminPost}:${key}:${JSON.stringify(context)}`, async () => {
+      const photo: any = await this.once(scope, `upload:${key}`, () => this.uploads.findOne({
         $or: [{ s3Key: key }, { key }], state: { $in: ['approved', 'attached'] },
-      });
+      }));
       if (!photo || storedKey(photo) !== key || !matchesBinding(photo, context))
         throw new NotFoundException('Photo not available');
+      const target = variant === 'thumbnail' ? photo.thumbKey : key;
+      if (!target) throw new NotFoundException('Photo not available');
       if (!adminPost) await this.activeOwner(context.ownerId, scope);
       await this.pairAccess(context, adminPost, scope);
       const premium = await this.premiumAccess(context, adminPost, scope);
       // No cross-request URL cache: every request rechecks resource and authorization state.
       // Chat and premium bytes must not outlive that check in an HTTP cache.
-      const url = await this.storage.getSignedURL(storedKey(photo), undefined, seconds, context.resourceType === 'chat' || premium);
+      const url = await this.storage.getSignedURL(target, undefined, seconds, context.resourceType === 'chat' || premium);
       await this.pairAccess(context, adminPost, scope);
       await this.premiumAccess(context, adminPost, scope);
       return url;
@@ -653,9 +745,12 @@ export class PhotosService implements OnModuleInit {
 
   private async assertPairAccess(context: ResourceContext, adminPost = false, scope?: PresentScope) {
     if (adminPost && context.resourceType === 'post') return;
-    const collection = ({ profile: 'Users', post: 'Posts', event: 'Events', group: 'Groups', chat: 'ChatMessages' })[context.resourceType];
-    if (collection && await restrictedResource(this.db, collection, context.resourceId, context.ownerId))
-      throw new NotFoundException('Media not found');
+    const collection = RESTRICTION_COLLECTIONS[context.resourceType];
+    const keys = [`${collection}:${context.resourceId}`, `Users:${context.ownerId}`];
+    const restricted = scope && keys.every(key => scope.restrictionsRead.has(key))
+      ? keys.some(key => scope.restricted.has(key))
+      : collection && await restrictedResource(this.db, collection, context.resourceId, context.ownerId);
+    if (restricted) throw new NotFoundException('Media not found');
     if (blockContext.getStore()?.bypass) return;
     if (!context.requester) throw new NotFoundException('Photo not available');
     if (context.resourceType === 'post' && !await canReadPost(this.db, context.resourceId, context.requester,
@@ -765,6 +860,19 @@ export class PhotosService implements OnModuleInit {
   }
 
   @Cron(CronExpression.EVERY_MINUTE)
+  async thumbnails() {
+    try {
+      const rows = await this.uploads.find({
+        state: 'attached', resourceType: { $in: THUMB_TYPES },
+        thumbKey: { $exists: false }, thumbUnavailable: { $ne: true },
+      }, { projection: { _id: 1 } }).limit(THUMB_BACKFILL).toArray();
+      for (const row of rows) await this.buildThumbnail(String(row._id));
+    } catch {
+      this.logger.warn('Photo thumbnails pending retry');
+    }
+  }
+
+  @Cron(CronExpression.EVERY_MINUTE)
   async cleanup() {
     try {
       const abandoned = await this.uploads
@@ -785,7 +893,7 @@ export class PhotosService implements OnModuleInit {
         .toArray();
       for (const photo of abandoned) {
         await this.enqueue(
-          [photo.tempKey, photo.key, photo.processingKey, photo.finalKey, photo.previewKey, photo.previewProcessingKey],
+          [photo.tempKey, photo.key, photo.processingKey, photo.finalKey, photo.previewKey, photo.previewProcessingKey, photo.thumbKey],
           new Date(Math.max(Date.now(), photo.expiresAt.getTime() + 60000)),
           true,
         );
@@ -803,7 +911,7 @@ export class PhotosService implements OnModuleInit {
         .limit(100)
         .toArray()) {
         if (!(await this.inUse(photo.key))) {
-          await this.enqueue([photo.key, photo.tempKey, photo.previewKey]);
+          await this.enqueue([photo.key, photo.tempKey, photo.previewKey, photo.thumbKey]);
           await this.uploads.updateOne(
             { _id: photo._id, state: 'attached', ref: photo.ref },
             { $set: { state: 'deleting', status: 'deleting' } },
@@ -842,7 +950,7 @@ export class PhotosService implements OnModuleInit {
         if (
           job.onlyIfUnused &&
           ((await this.uploads.findOne({
-            $or: [{ key: job.key }, { previewKey: job.key }],
+            $or: [{ key: job.key }, { previewKey: job.key }, { thumbKey: job.key }],
             state: { $in: ['approved', 'attached'] },
           })) ||
             (await this.videoUploads.findOne({
@@ -921,6 +1029,7 @@ export class PhotosService implements OnModuleInit {
   private async inUse(key: string) {
     if (await hasPreservationHold(this.db, [`key:${key}`])) return true;
     if (key.startsWith('previews/') && await this.uploads.findOne({ previewKey: key, state: { $in: ['approved', 'attached'] } })) return true;
+    if (/\/\d+\.webp$/.test(key) && await this.uploads.findOne({ thumbKey: key, state: { $in: ['approved', 'attached'] } })) return true;
     // A temp video is the moderation source until it is copied.
     if (key.startsWith('temp/') && await this.videoUploads.findOne({ tempKey: key, state: { $in: ['pending', 'scanning'] } })) return true;
     if (key.startsWith('temp/')) return !!(await this.uploads.findOne({ key, state: { $in: ['approved', 'attached'] } }));
@@ -1052,6 +1161,7 @@ export class PhotosService implements OnModuleInit {
       add(photo.tempKey);
       add(photo.processingKey);
       add(photo.previewKey);
+      add(photo.thumbKey);
       add(photo.previewProcessingKey);
       add(photo.finalKey);
     }

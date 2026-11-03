@@ -23,6 +23,7 @@ export async function storageIndexes(db: Connection, apply = false, report = con
       partialFilterExpression: { s3Key: { $type: 'string' }, ...(duplicates[name].length ? { storageKeyUniqueEligible: true } : {}) },
     });
     await collection.createIndex({ ownerId: 1, resourceType: 1, resourceId: 1 }, { background: true });
+    if (name === 'PhotoUploads') await collection.createIndex({ thumbKey: 1 }, { sparse: true, background: true });
     await collection.createIndex({ owner: 1, slot: 1 }, { unique: true, background: true });
     await collection.createIndex(name === 'PhotoUploads' ? { owner: 1, requestId: 1 } : { owner: 1, id: 1 }, { unique: true, background: true });
   }

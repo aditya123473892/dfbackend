@@ -1051,15 +1051,16 @@ integration('Phase 2 report preservation', () => {
     expect(result.text).not.toContain(String(group));
     expect(result.text).not.toContain(String(a));
   });
-  it('alerts on expired gate and retries durable cleanup/account purge after explicit fenced recovery', async () => {
+  it('alerts on an expired gate, keeps a recent one, and takes over an abandoned one without an operator', async () => {
     const token = randomUUID();
-    await db.db.collection<any>('ReportCoordination').insertOne({ _id: 'sources', token, leaseUntil: new Date(0) });
+    // Expired, but recently enough that its holder may still be finishing an S3 delete.
+    await db.db.collection<any>('ReportCoordination').insertOne({ _id: 'sources', token, leaseUntil: new Date(Date.now() - 1000) });
     const errorLog = jest.spyOn(Logger.prototype, 'error').mockImplementation(() => {});
     const log = jest.spyOn(Logger.prototype, 'log').mockImplementation(() => {});
     const warning = jest.spyOn(Logger.prototype, 'warn').mockImplementation(() => {});
     try {
       await reports.preservationMetrics();
-      expect(errorLog).toHaveBeenCalledWith('report_gate_expired count=1; operator recovery required');
+      expect(errorLog).toHaveBeenCalledWith('report_gate_expired count=1; the next deletion takes it over');
       // No live reference; this cleanup must encounter the busy gate.
       await db.db.collection('PhotoDeletionJobs').insertOne({ key: 'orphan.jpg', dueAt: new Date(0), attempts: 0 });
       await db.db.collection<any>('AccountPurges').insertOne({ _id: String(a), dueAt: new Date(0), attempts: 0 });
@@ -1069,13 +1070,15 @@ integration('Phase 2 report preservation', () => {
       expect((await db.db.collection<any>('AccountPurges').findOne({ _id: String(a) })).attempts).toBe(1);
       expect(storage.deleteOne).not.toHaveBeenCalled();
       await expect(recoverPreservationGate(db, 'wrong')).rejects.toThrow('recovery denied');
-      await recoverPreservationGate(db, token);
-      expect(warning).toHaveBeenCalledWith('report_gate_operator_recovery count=1');
+      // Long past expiry: its holder is gone, so the next deletion takes the gate over.
+      await db.db.collection<any>('ReportCoordination').updateOne({ _id: 'sources' }, { $set: { leaseUntil: new Date(0) } });
       await db.db.collection('PhotoDeletionJobs').updateMany({}, { $set: { dueAt: new Date(0) } });
       await db.db.collection('AccountPurges').updateMany({}, { $set: { dueAt: new Date(0) } });
       await photos.cleanup();
       expect(await db.db.collection<any>('AccountPurges').findOne({ _id: String(a) })).toBeNull();
       expect(storage.deleteOne).toHaveBeenCalledWith('orphan.jpg');
+      expect(warning).toHaveBeenCalledWith(JSON.stringify({ metric: 'report_gate_takeover', count: 1 }));
+      expect(await db.db.collection<any>('ReportCoordination').findOne({ _id: 'sources' })).toBeNull();
     } finally { errorLog.mockRestore(); log.mockRestore(); warning.mockRestore(); }
   }, 30000);
   it('emits counts only and never logs or returns report text, image keys or signed URLs', async () => {

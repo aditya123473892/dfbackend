@@ -43,6 +43,15 @@ interface PostWithFollowStatus extends PostWithCounts {
 
 const idOf = (value: any): string => String(value?._id ?? value ?? '');
 const MAX_PAGE_SIZE = 50;
+/** Newest comments shown on each feed card. */
+const FEED_COMMENT_PREVIEWS = 3;
+/** Feed scans read candidate posts in batches and drop hidden authors' posts. */
+const FEED_BATCH_MIN = 10;
+const FEED_BATCH_MAX = 100;
+/** Batches one feed page may read before returning what it found with a cursor. */
+const MAX_FEED_BATCHES = 5;
+/** Offset paging (legacy clients) is scanned the same way, so it is bounded. */
+const MAX_FEED_OFFSET = 1000;
 const SORTABLE_FIELDS = ['createdAt', 'updatedAt', '_id'];
 const AUTHOR_FIELDS = 'displayname avatar';
 
@@ -188,35 +197,35 @@ export class PostsService {
       select: AUTHOR_FIELDS,
     });
 
-    query.populate({
-      path: 'likes',
-      select: 'user',
-      populate: {
-        path: 'user',
-        select: AUTHOR_FIELDS,
-      },
-    });
-
-    query.populate({
-      path: 'comments',
-      select: 'content user createdAt',
-      populate: {
-        path: 'user',
-        select: AUTHOR_FIELDS,
-      },
-    });
-
-    if (params.summary === 'true') {
-      // Keep counts from the original reference arrays, but hydrate only what a feed card displays.
+    const summary = params.summary === 'true';
+    if (summary) {
+      // A feed card shows only the viewer's own like and the newest comments, loaded
+      // for the whole page in one aggregation below.
       query.populate({ path: 'likes', match: { user: authUserId }, select: 'user' });
-      query.populate({ path: 'comments', select: 'content user createdAt',
-        options: { sort: { createdAt: -1 }, limit: 3 }, populate: { path: 'user', select: AUTHOR_FIELDS } });
+    } else {
+      query.populate({
+        path: 'likes',
+        select: 'user',
+        populate: {
+          path: 'user',
+          select: AUTHOR_FIELDS,
+        },
+      });
+
+      query.populate({
+        path: 'comments',
+        select: 'content user createdAt',
+        populate: {
+          path: 'user',
+          select: AUTHOR_FIELDS,
+        },
+      });
     }
     const { posts, count, nextCursor } = await this.priorityPage(query, params, authUserId);
 
     const postIds = posts.map((post) => post._id);
     const authorIds = [...new Set(posts.map((post) => idOf(post.user)).filter(Boolean))];
-    const [userBookmarks, follows, likeCounts, commentCounts] = await Promise.all([
+    const [userBookmarks, follows, likeCounts, commentSummaries] = await Promise.all([
       this.PostBookMarkModel.find({
         userId: authUserId,
         postId: { $in: postIds },
@@ -225,17 +234,32 @@ export class PostsService {
       this.followModel
         .find({ follower: authUserId, following: { $in: authorIds }, status: { $in: ['pending', 'accepted'] } })
         .select('following status'),
-      params.summary === 'true' ? this.likeModel.aggregate([
+      summary ? this.likeModel.aggregate([
         { $match: { post: { $in: postIds } } }, { $group: { _id: '$post', count: { $sum: 1 } } },
       ]) : [],
-      params.summary === 'true' ? this.commentModel.aggregate([
-        { $match: { post: { $in: postIds } } }, { $group: { _id: '$post', count: { $sum: 1 } } },
+      // Count and the three newest comments of every post on the page, in one query.
+      summary ? this.commentModel.aggregate([
+        { $match: { post: { $in: postIds } } },
+        { $group: {
+          _id: '$post',
+          count: { $sum: 1 },
+          newest: { $topN: { n: FEED_COMMENT_PREVIEWS, sortBy: { createdAt: -1, _id: -1 },
+            output: { _id: '$_id', content: '$content', user: '$user', createdAt: '$createdAt' } } },
+        } },
       ]) : [],
     ]);
+    const commenters = summary
+      ? await this.postsModel.db.model('Users')
+        .find({ _id: { $in: [...new Set(commentSummaries.flatMap((row: any) => row.newest.map((c: any) => String(c.user))))] } })
+        .select(AUTHOR_FIELDS).lean()
+      : [];
+    const commenterById = new Map(commenters.map((user: any) => [String(user._id), user]));
+    const previews = new Map(commentSummaries.map((row: any) => [String(row._id),
+      row.newest.map((comment: any) => ({ ...comment, user: commenterById.get(String(comment.user)) || comment.user }))]));
 
     const bookmarkedPostIds = new Set(userBookmarks.map((bm) => bm.postId.toString()));
     const countsByPost = (rows: any[]) => new Map(rows.map(row => [String(row._id), row.count] as const));
-    const likes = countsByPost(likeCounts), comments = countsByPost(commentCounts);
+    const likes = countsByPost(likeCounts), comments = countsByPost(commentSummaries);
     const followStatusByAuthor = new Map(
       follows.map((follow: any) => [
         idOf(follow.following),
@@ -246,8 +270,9 @@ export class PostsService {
     const postsWithFollowStatus = await Promise.all(
       posts.map(async (post) => ({
         ...(await this.toClientPost(post)),
-        likeCount: params.summary === 'true' ? likes.get(String(post._id)) || 0 : post.likes.length,
-        commentCount: params.summary === 'true' ? comments.get(String(post._id)) || 0 : post.comments.length,
+        ...(summary ? { comments: previews.get(String(post._id)) || [] } : {}),
+        likeCount: summary ? likes.get(String(post._id)) || 0 : post.likes.length,
+        commentCount: summary ? comments.get(String(post._id)) || 0 : post.comments.length,
         likedByMe: this.isLikedBy(post, authUserId),
         followStatus: followStatusByAuthor.get(idOf(post.user)) || 'None',
         isBookmarked: bookmarkedPostIds.has(post._id.toString()),
@@ -257,7 +282,7 @@ export class PostsService {
     return { posts: postsWithFollowStatus as unknown as PostWithFollowStatus[], count, nextCursor };
   }
 
-  /** Two indexed, bounded group queries; the cursor carries group and a stable timestamp/id tie-breaker. */
+  /** Followed accounts first, then everyone else; the cursor carries group and a stable timestamp/id tie-breaker. */
   private async priorityPage(query: any, params: FilterPostDto, viewer: string) {
     const follows = await this.followModel.find({ follower: viewer, status: 'accepted' }).select('following').lean();
     const ids = follows.map(f => f.following).sort((a,b) => String(a).localeCompare(String(b)));
@@ -270,47 +295,73 @@ export class PostsService {
         if (![0,1].includes(cursor.group) || !Number.isFinite(Date.parse(cursor.asOf)) ||
           Date.parse(cursor.asOf) > Date.now() + 1000 || !Types.ObjectId.isValid(cursor.id) ||
           !Number.isFinite(Date.parse(cursor.date)) || Date.parse(cursor.date) > Date.parse(cursor.asOf) ||
-          cursor.fingerprint !== fingerprint) throw new Error();
+          cursor.fingerprint !== fingerprint ||
+          (cursor.count !== undefined && !(Number.isInteger(cursor.count) && cursor.count >= 0))) throw new Error();
       } catch { throw new BadRequestException('Feed changed or cursor invalid. Refresh the feed.'); }
     }
     const size = Math.max(1, Math.min(MAX_PAGE_SIZE, Number(params.limit) || 20));
-    // Private-account public posts are discoverable only by accepted followers or their owner.
-    const [excluded, privateUsers] = await Promise.all([
-      blockedIds(this.postsModel.db, viewer),
-      this.postsModel.db.model('Users').find({ $or: [
-        { isPrivate: true, _id: { $nin: [...ids, new Types.ObjectId(viewer)] } },
-        { isBlocked: true }, { deletionRequestedAt: { $ne: null } },
-        { moderationSuspendedUntil: { $gt: new Date() } },
-      ] }).select('_id').lean(),
-    ]);
-    query.where({ user: { $nin: [...privateUsers.map(u => u._id), ...excluded.map(id => new Types.ObjectId(id))] } });
+    // Legacy clients page by offset; current ones by cursor.
+    const offset = params.cursor ? 0 : Math.max(0, Math.min(MAX_FEED_OFFSET, Number(params.skip) || 0));
+    const excluded = await blockedIds(this.postsModel.db, viewer);
+    query.where({ user: { $nin: excluded.map(id => new Types.ObjectId(id)) } });
     query.and([{ $or: [{ createdAt: { $lte: new Date(cursor.asOf) } }, { createdAt: null }] }]);
     const groupQuery = (group: number) => query.clone().and([{ user: group === 0 ? { $in: ids } : { $nin: ids } }]);
-    const [count, followingCount] = await Promise.all([
-      this.postsModel.countDocuments(query.getQuery()), this.postsModel.countDocuments(groupQuery(0).getQuery()),
-    ]);
+    // Counted once per feed (first page) and carried in the cursor. It includes posts
+    // of accounts filtered out below, so it is an upper bound.
+    const count = Number.isInteger(cursor.count) ? cursor.count : await this.postsModel.countDocuments(query.getQuery());
+
+    // Private-account public posts are discoverable only by accepted followers or their
+    // owner. Rather than excluding every such account up front, each scanned batch
+    // looks up only its own authors.
+    const hiddenAuthors = new Map<string, boolean>();
+    const lookUpAuthors = async (rows: any[]) => {
+      const unknown = [...new Set(rows.map(row => idOf(row.user)))].filter(id => !hiddenAuthors.has(id) && Types.ObjectId.isValid(id));
+      if (!unknown.length) return;
+      const hidden = await this.postsModel.db.model('Users').find({
+        _id: { $in: unknown.map(id => new Types.ObjectId(id)) },
+        $or: [
+          { isPrivate: true, _id: { $nin: [...ids, new Types.ObjectId(viewer)] } },
+          { isBlocked: true }, { deletionRequestedAt: { $ne: null } },
+          { moderationSuspendedUntil: { $gt: new Date() } },
+        ],
+      }).select('_id').lean();
+      const set = new Set(hidden.map(user => String(user._id)));
+      for (const id of unknown) hiddenAuthors.set(id, set.has(id));
+    };
+    // Rows strictly after (older than) a position in feed order; null dates sort last.
+    const after = (date: Date | null, id: Types.ObjectId) => date
+      ? { $or: [{ createdAt: { $lt: date } }, { createdAt: date, _id: { $lt: id } }, { createdAt: null }] }
+      : { createdAt: null, _id: { $lt: id } };
+
+    const target = offset + size + 1;
     let rows: any[] = [], groups: number[] = [];
-    let offset = params.cursor ? 0 : Math.max(0, Number(params.skip) || 0);
-    for (let group = cursor.group; group <= 1 && rows.length <= size; group++) {
+    let group: number = cursor.group;
+    let position = cursor.id ? after(cursor.legacy ? null : new Date(cursor.date), new Types.ObjectId(cursor.id)) : undefined;
+    let scanned: { row: any; group: number } | undefined;
+    for (let batch = 0; group <= 1 && rows.length < target && batch < MAX_FEED_BATCHES + Math.ceil(offset / size); batch++) {
       const part = groupQuery(group);
-      if (cursor.id && group === cursor.group) part.and([cursor.legacy
-        ? { createdAt: null, _id: { $lt: new Types.ObjectId(cursor.id) } }
-        : { $or: [
-        { createdAt: { $lt: new Date(cursor.date) } },
-        { createdAt: new Date(cursor.date), _id: { $lt: new Types.ObjectId(cursor.id) } },
-        { createdAt: null },
-      ] }]);
-      if (!params.cursor && group === 0 && offset >= followingCount) { offset -= followingCount; continue; }
-      const found = await part.sort({ createdAt: -1, _id: -1 }).skip(offset).limit(size + 1 - rows.length).exec();
-      offset = 0;
-      rows.push(...found); groups.push(...found.map(() => group));
+      if (position) part.and([position]);
+      const limit = Math.min(FEED_BATCH_MAX, Math.max(FEED_BATCH_MIN, (target - rows.length) * 2));
+      const found = await part.sort({ createdAt: -1, _id: -1 }).limit(limit).exec();
+      await lookUpAuthors(found);
+      for (const row of found) {
+        scanned = { row, group };
+        if (hiddenAuthors.get(idOf(row.user))) continue;
+        rows.push(row); groups.push(group);
+        if (rows.length >= target) break;
+      }
+      if (rows.length >= target) break;
+      if (found.length < limit) { group++; position = undefined; }
+      else position = after(scanned!.row.createdAt || null, scanned!.row._id);
     }
-    const hasMore = rows.length > size;
-    rows = rows.slice(0,size);
-    const last = rows[rows.length-1];
-    const nextCursor = hasMore && last ? Buffer.from(JSON.stringify({ group: groups[rows.length-1],
-      asOf: cursor.asOf, fingerprint, legacy: !last.createdAt,
-      date: new Date(last.createdAt || last._id.getTimestamp()).toISOString(), id: String(last._id) })).toString('base64url') : undefined;
+    rows = rows.slice(offset); groups = groups.slice(offset);
+    // A full page continues after its last row; a scan stopped early, after the last row it read.
+    const mark = rows.length > size ? { row: rows[size - 1], group: groups[size - 1] }
+      : group <= 1 ? scanned : undefined;
+    rows = rows.slice(0, size);
+    const nextCursor = mark ? Buffer.from(JSON.stringify({ group: mark.group,
+      asOf: cursor.asOf, fingerprint, count, legacy: !mark.row.createdAt,
+      date: new Date(mark.row.createdAt || mark.row._id.getTimestamp()).toISOString(), id: String(mark.row._id) })).toString('base64url') : undefined;
     return { posts: rows, count, nextCursor };
   }
 

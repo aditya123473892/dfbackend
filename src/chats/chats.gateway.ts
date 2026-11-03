@@ -18,6 +18,20 @@ import { ERole } from 'src/common/enums';
 import { PhotosService } from '../photos/photos.service';
 import { BlockService } from '../user-blocks/block.service';
 
+/**
+ * Database account checks are reused for this long per socket. Suspension,
+ * bans, blocks and account deletion also disconnect sockets immediately.
+ */
+const ACCOUNT_RECHECK_MS = 15_000;
+
+/**
+ * Requests that send `reply: 'ack'` get their result or error only in their
+ * own acknowledgement, as `{ ok, data | error }`, so an answer can never be
+ * taken for another request's. Requests without it keep the legacy events.
+ */
+const wantsAck = (data: unknown) =>
+  Boolean(data && typeof data === 'object' && (data as { reply?: unknown }).reply === 'ack');
+
 function socketCorsOrigin(
   origin: string,
   callback: (error: Error, allow?: boolean) => void,
@@ -96,7 +110,7 @@ export class ChatGateway
       const userId = client.data.userId;
       client.use(async (_packet, next) => {
         try {
-          await this.authenticateClient(client);
+          await this.authenticateClient(client, true);
           next();
         } catch {
           client.emit('authError', { message: 'Account is unavailable' });
@@ -164,7 +178,9 @@ export class ChatGateway
       }
       return { groupId };
     } catch (error) {
+      // The legacy event first; current clients read the acknowledgement.
       this.emitError(client, error);
+      return { ok: false, error: this.errorBody(error) };
     }
   }
 
@@ -208,7 +224,7 @@ export class ChatGateway
 
   @SubscribeMessage('getChatHistory')
   async handleGetChatHistory(
-    @MessageBody() data: { user1?: string; user2: string; limit?: number; before?: string },
+    @MessageBody() data: { user1?: string; user2: string; limit?: number; before?: string; reply?: 'ack' },
     @ConnectedSocket() client: Socket,
   ) {
     try {
@@ -221,27 +237,32 @@ export class ChatGateway
         data.user2,
         'Conversation not found',
       );
+      if (wantsAck(data)) return { ok: true, data: history };
       client.emit('chatHistory', history);
     } catch (error) {
-      this.emitError(client, error);
+      return this.fail(client, error, data);
     }
   }
 
   @SubscribeMessage('markAsRead')
   async handleMarkAsRead(
-    @MessageBody() data: { user1?: string; user2: string },
+    @MessageBody() data: { user1?: string; user2: string; reply?: 'ack' },
     @ConnectedSocket() client: Socket,
   ) {
+    let unread: unknown;
     try {
       const userId = client.data.userId;
-      const unread = await this.chatService.markMessagesAsRead(userId, data.user2);
-      client.emit('unreadMessageCount', unread);
+      unread = await this.chatService.markMessagesAsRead(userId, data.user2);
+      if (!wantsAck(data)) client.emit('unreadMessageCount', unread);
       // Keep the reader's other devices in sync.
       client.to(`user:${userId}`).emit('unreadMessageCount', unread);
       await this.blocks.assertVisible(userId, data.user2, 'Conversation not found');
       this.server.to(`user:${data.user2}`).emit('messagesRead', { userId });
+      if (wantsAck(data)) return { ok: true, data: unread };
     } catch (error) {
-      this.emitError(client, error);
+      // Messages already marked read stay read; only the peer's receipt is withheld.
+      if (wantsAck(data) && unread !== undefined) return { ok: true, data: unread };
+      return this.fail(client, error, data);
     }
   }
 
@@ -260,11 +281,36 @@ export class ChatGateway
   }
 
   @SubscribeMessage('getUnreadCount')
-  async handleGetUnreadCount(@ConnectedSocket() client: Socket) {
-    client.emit(
-      'unreadMessageCount',
-      await this.chatService.getUnreadMessageCount(client.data.userId),
-    );
+  async handleGetUnreadCount(
+    @ConnectedSocket() client: Socket,
+    @MessageBody() data?: { reply?: 'ack' },
+  ) {
+    try {
+      const unread = await this.chatService.getUnreadMessageCount(client.data.userId);
+      if (wantsAck(data)) return { ok: true, data: unread };
+      client.emit('unreadMessageCount', unread);
+    } catch (error) {
+      return this.fail(client, error, data);
+    }
+  }
+
+  /**
+   * Which of these message IDs still exist in one conversation the caller can
+   * read, so a client can drop messages deleted while it was offline.
+   */
+  @SubscribeMessage('verifyMessages')
+  async handleVerifyMessages(
+    @MessageBody() data: { user2?: string; groupId?: string; ids?: string[]; reply?: 'ack' },
+    @ConnectedSocket() client: Socket,
+  ) {
+    try {
+      const existing = await this.chatService.existingMessageIds(client.data.userId, data, data?.ids);
+      if (data?.user2)
+        await this.blocks.assertVisible(client.data.userId, data.user2, 'Conversation not found');
+      return { ok: true, data: existing };
+    } catch (error) {
+      return this.fail(client, error, { reply: 'ack' });
+    }
   }
 
   /**
@@ -299,7 +345,7 @@ export class ChatGateway
   @SubscribeMessage('updateMessage')
   async handleUpdateMessage(
     @MessageBody()
-    data: { messageId: string; userId?: string; newMessage: string },
+    data: { messageId: string; userId?: string; newMessage: string; reply?: 'ack' },
     @ConnectedSocket() client: Socket,
   ) {
     try {
@@ -309,15 +355,15 @@ export class ChatGateway
         data.newMessage,
       );
       await this.broadcastSavedMessage(updated, 'messageUpdated');
-      return updated;
+      return wantsAck(data) ? { ok: true, data: updated } : updated;
     } catch (error) {
-      this.emitError(client, error);
+      return this.fail(client, error, data);
     }
   }
 
   @SubscribeMessage('deleteMessage')
   async handleDeleteMessage(
-    @MessageBody() data: { messageId: string; userId?: string },
+    @MessageBody() data: { messageId: string; userId?: string; reply?: 'ack' },
     @ConnectedSocket() client: Socket,
   ) {
     try {
@@ -325,12 +371,11 @@ export class ChatGateway
         data.messageId,
         client.data.userId,
       );
-      await this.broadcastSavedMessage(
-        { ...deleted, messageId: data.messageId },
-        'messageDeleted',
-      );
+      const event = { ...deleted, messageId: data.messageId };
+      await this.broadcastSavedMessage(event, 'messageDeleted');
+      if (wantsAck(data)) return { ok: true, data: event };
     } catch (error) {
-      this.emitError(client, error);
+      return this.fail(client, error, data);
     }
   }
 
@@ -365,7 +410,7 @@ export class ChatGateway
 
   @SubscribeMessage('getGroupChatHistory')
   async handleGetGroupChatHistory(
-    @MessageBody() data: { groupId: string; limit?: number; before?: string },
+    @MessageBody() data: { groupId: string; limit?: number; before?: string; reply?: 'ack' },
     @ConnectedSocket() client: Socket,
   ) {
     try {
@@ -374,9 +419,10 @@ export class ChatGateway
         before: data?.before,
       });
       await this.chatService.assertGroupMember(client.data.userId, data.groupId);
+      if (wantsAck(data)) return { ok: true, data: history };
       client.emit('groupChatHistory', history);
     } catch (error) {
-      this.emitError(client, error);
+      return this.fail(client, error, data);
     }
   }
 
@@ -462,14 +508,29 @@ export class ChatGateway
     }
   }
 
-  private emitError(client: Socket, error: any) {
-    client.emit('error', {
+  private errorBody(error: any) {
+    return {
       statusCode: error?.getStatus?.() || 400,
       message: error?.message || 'Chat operation failed',
-    });
+    };
   }
 
-  private async authenticateClient(client: Socket) {
+  private emitError(client: Socket, error: any) {
+    client.emit('error', this.errorBody(error));
+  }
+
+  /** The request's own acknowledgement when it asked for one, else the legacy event. */
+  private fail(client: Socket, error: any, data: unknown) {
+    if (wantsAck(data)) return { ok: false, error: this.errorBody(error) };
+    this.emitError(client, error);
+  }
+
+  /**
+   * The JWT (signature and expiry) is verified on every call. With `reuse`,
+   * the database account checks are skipped within ACCOUNT_RECHECK_MS of the
+   * last ones for this socket.
+   */
+  private async authenticateClient(client: Socket, reuse = false) {
     const supplied = client.handshake.auth?.token;
     const token =
       typeof supplied === 'string' ? supplied.replace(/^Bearer\s+/i, '') : '';
@@ -478,9 +539,13 @@ export class ChatGateway
     const userId = String(payload?.sub || '');
     if (!ObjectId.isValid(userId))
       throw new Error('Invalid authentication token');
+    if (reuse && client.data.userId === userId &&
+        Date.now() - (client.data.accountCheckedAt ?? 0) < ACCOUNT_RECHECK_MS)
+      return;
     const user = await this.chatService.getUserById(userId);
     if (!user) throw new Error('Invalid authentication token');
     await this.photos.assertActiveAccount(userId);
     client.data.userId = userId;
+    client.data.accountCheckedAt = Date.now();
   }
 }

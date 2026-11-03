@@ -359,13 +359,13 @@ export class S3BucketService implements OnModuleInit {
       throw new BadRequestException('Cloud encryption verification failed');
     return true;
   }
-  async putApproved(key: string, bytes: Buffer) {
+  async putApproved(key: string, bytes: Buffer, contentType: 'image/jpeg' | 'image/webp' = 'image/jpeg') {
     return this.s3
       .putObject({
         Bucket: this.bucketFor(key),
         Key: key,
         Body: bytes,
-        ContentType: 'image/jpeg',
+        ContentType: contentType,
         ContentDisposition: 'inline',
         ServerSideEncryption: 'AES256',
         CacheControl: /^(vault|chat)\//.test(key) ? 'private, no-store' : 'private, max-age=120',

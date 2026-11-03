@@ -46,7 +46,7 @@ export class ReportsService implements OnModuleInit {
     this.logger.log(JSON.stringify({ metric: 'report_preservation',
       heldSources: heldSources[0]?.count || 0, pendingCopyJobs }));
     if (gate && (!gate.leaseUntil || gate.leaseUntil <= new Date()))
-      this.logger.error('report_gate_expired count=1; operator recovery required');
+      this.logger.error('report_gate_expired count=1; the next deletion takes it over');
   }
   private setting(name: string, fallback: number, maximum: number) {
     return Math.min(

@@ -373,6 +373,33 @@ export class ChatService {
     }));
   }
 
+  /**
+   * Of `ids`, those still present (and not expired) in one conversation the
+   * actor can read: `{ user2 }` or `{ groupId }`. At most 500 per request.
+   */
+  async existingMessageIds(actorId: string, conversation: { user2?: string; groupId?: string }, ids: unknown) {
+    if (!Array.isArray(ids) || ids.length > 500 || !ids.every((id) => typeof id === 'string' && ObjectId.isValid(id)))
+      throw new BadRequestException('Invalid message IDs');
+    let filter: any;
+    if (conversation?.groupId) {
+      await this.assertGroupMember(actorId, conversation.groupId);
+      filter = { groupId: anyId(conversation.groupId) };
+    } else {
+      await this.assertCanSendDirect(actorId, conversation?.user2);
+      filter = {
+        $or: [
+          { sender: anyId(actorId), receiver: anyId(conversation.user2) },
+          { sender: anyId(conversation.user2), receiver: anyId(actorId) },
+        ],
+      };
+    }
+    const rows = await this.chatMessageModel
+      .find(live({ $and: [filter, { _id: { $in: ids.map(toObjectId) } }] }))
+      .select('_id')
+      .lean();
+    return rows.map((row: any) => String(row._id));
+  }
+
   async getUnreadMessageCount(actorId: string) {
     // Kept as an array of unread direct messages for compatibility; only the
     // fields clients need to count and attribute them are returned.
@@ -493,6 +520,11 @@ export class ChatService {
       : [];
     const unreadByGroup = new Map(groupUnread.map((row) => [String(row._id), row.count]));
     const lastByGroup = new Map(groupLast.map((row) => [String(row._id), row.last]));
+    // As in group history: a blocked sender's message keeps its place without content.
+    const blocked = new Set(groupIds.length ? await this.blocks.ids(actorId, true) : []);
+    const groupPreview = (last: any) => blocked.has(String(last.sender))
+      ? { ...this.toClientMessage(last), message: '', media: [], blockedSender: true }
+      : this.toClientMessage(last);
 
     const conversations = [
       ...direct
@@ -521,7 +553,7 @@ export class ChatService {
             createdAt: group.createdAt,
             updatedAt: group.updatedAt,
           },
-          lastMessage: last ? this.toClientMessage(last) : null,
+          lastMessage: last ? groupPreview(last) : null,
           unreadCount: unreadByGroup.get(String(group._id)) || 0,
           updatedAt: last?.sentAt || group.createdAt,
         };
