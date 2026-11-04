@@ -47,10 +47,12 @@ export class MediaService {
     return this.storage.getSignedURL(key, undefined, originalUrlSeconds(), true);
   }
 
-  previewUrl(key?: string) {
+  async previewUrl(key?: string): Promise<string> {
     if (!key || !/^previews\/[a-f\d]{24}\/[a-f\d-]{36}\.jpg$/.test(key)) return '';
     const configured = process.env.PHOTO_PREVIEW_BASE_URL;
-    if (!configured) throw new ServiceUnavailableException('Photo previews are not configured');
+    // Private preview objects can be delivered without a separate public CDN.
+    // Validate the preview namespace above before invoking any signer.
+    if (!configured) return (await this.storage.getSignedURL(key, undefined, originalUrlSeconds(), true)) || '';
     const base = new URL(configured);
     if (base.protocol !== 'https:' || base.username || base.password || base.search || base.hash || base.pathname !== '/')
       throw new ServiceUnavailableException('PHOTO_PREVIEW_BASE_URL must be an HTTPS origin');

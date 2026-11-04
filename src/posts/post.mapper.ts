@@ -18,7 +18,7 @@ interface PostMediaDelivery {
   original: (image: any) => Promise<string>;
   /** The grid-sized copy, signed like the original; '' until one exists. */
   thumbnail?: (image: any) => Promise<string>;
-  preview: (key?: string) => string;
+  preview: (key?: string) => string | Promise<string>;
   /** Signs one bound post video; resolves '' when it is unavailable. */
   video?: (video: any) => Promise<string>;
 }
@@ -34,7 +34,7 @@ export class PostMapper {
       // Never spread image documents: even authorized viewers get only these fields.
       const result = {
         id: String(image.photoId || image._id || `${post._id}:${index}`),
-        url: locked ? delivery.preview(image.previewKey) : await delivery.original(image),
+        url: locked ? await delivery.preview(image.previewKey) : await delivery.original(image),
         thumbnailUrl: locked || !delivery.thumbnail ? '' : await delivery.thumbnail(image),
         blurhash: image.blurhash || null,
         // Stored after EXIF orientation is applied; null for legacy rows until backfilled.

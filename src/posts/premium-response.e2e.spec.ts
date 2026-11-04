@@ -51,7 +51,7 @@ describe('Premium HTTP response pipeline', () => {
   let app: INestApplication;
   const storage = {
     keyFromReference: (value?: string) => value,
-    getSignedURL: jest.fn(async () => `https://s3.test/${key}?X-Amz-Signature=secret`),
+    getSignedURL: jest.fn(async (requested: string) => `https://s3.test/${requested}?X-Amz-Signature=secret`),
   };
   const findOne = (name: string) => async (filter: any) => {
     if (name === 'Posts') return String(filter._id) === postId ? post : null;
@@ -85,6 +85,19 @@ describe('Premium HTTP response pipeline', () => {
     storage.getSignedURL.mockClear();
   });
   afterAll(async () => { await app.close(); delete process.env.PHOTO_PREVIEW_BASE_URL; });
+
+  it('delivers a private signed blurred preview without a CDN, never an original or clear thumbnail', async () => {
+    delete process.env.PHOTO_PREVIEW_BASE_URL;
+    const response = await request(app.getHttpServer()).get('/posts/one').expect(200);
+    expect(response.body.locked).toBe(true);
+    expect(response.body.images[0].url).toContain('https://s3.test/' + previewKey);
+    expect(response.body.images[0].thumbnailUrl).toBe('');
+    expect(typeof response.body.images[0].url).toBe('string');
+    expect(JSON.stringify(response.body)).not.toContain(key);
+    expect(storage.getSignedURL).toHaveBeenCalledTimes(1);
+    expect(storage.getSignedURL).toHaveBeenCalledWith(previewKey, undefined, 900, true);
+    expect(response.headers['cache-control']).toBe('private, no-store');
+  });
 
   it.each([
     ['get', '/posts/feed'], ['get', '/posts/one'], ['get', '/posts/bookmarks'], ['get', '/posts/profile'],

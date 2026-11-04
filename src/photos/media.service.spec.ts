@@ -2,6 +2,40 @@ import sharp = require('sharp');
 import { MediaService, originalUrlSeconds } from './media.service';
 
 describe('Premium previews', () => {
+  const previewKey = 'previews/507f1f77bcf86cd799439011/12345678-1234-4234-8234-123456789abc.jpg';
+  const previousPreviewBase = process.env.PHOTO_PREVIEW_BASE_URL;
+  afterEach(() => {
+    if (previousPreviewBase === undefined) delete process.env.PHOTO_PREVIEW_BASE_URL;
+    else process.env.PHOTO_PREVIEW_BASE_URL = previousPreviewBase;
+  });
+
+  it('signs only a blurred preview when no CDN is configured', async () => {
+    delete process.env.PHOTO_PREVIEW_BASE_URL;
+    const getSignedURL = jest.fn().mockResolvedValue('https://private.test/blurred-preview?signature=preview');
+    const url = await new MediaService({ getSignedURL } as any).previewUrl(previewKey);
+    expect(url).toBe('https://private.test/blurred-preview?signature=preview');
+    expect(getSignedURL).toHaveBeenCalledWith(previewKey, undefined, 900, true);
+  });
+
+  it('retains CDN delivery and rejects invalid origins without signing a fallback', async () => {
+    const getSignedURL = jest.fn();
+    const media = new MediaService({ getSignedURL } as any);
+    process.env.PHOTO_PREVIEW_BASE_URL = 'https://preview.test';
+    expect(await media.previewUrl(previewKey)).toBe('https://preview.test/' + previewKey);
+    for (const origin of ['http://preview.test', 'https://user:password@preview.test', 'https://preview.test/originals/']) {
+      process.env.PHOTO_PREVIEW_BASE_URL = origin;
+      await expect(media.previewUrl(previewKey)).rejects.toThrow();
+    }
+    expect(getSignedURL).not.toHaveBeenCalled();
+  });
+
+  it.each([undefined, '', 'posts/author/original.jpg', '../original.jpg', 'https://original.test/photo', previewKey + '/../original.jpg'])('never signs an invalid preview reference: %s', async key => {
+    delete process.env.PHOTO_PREVIEW_BASE_URL;
+    const getSignedURL = jest.fn();
+    expect(await new MediaService({ getSignedURL } as any).previewUrl(key)).toBe('');
+    expect(getSignedURL).not.toHaveBeenCalled();
+  });
+
   it('writes a small blurred JPEG without EXIF and a valid constant BlurHash', async () => {
     const putPreview = jest.fn();
     const media = new MediaService({ putPreview } as any);
