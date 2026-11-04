@@ -36,7 +36,15 @@ export class EventMembersService {
     }
 
     const newRequest = new this.eventsMembersModel(createEventMemberRequestDto);
-    return await newRequest.save();
+    const saved = await newRequest.save();
+    if (eventData.creator && String(eventData.creator) !== String(user))
+      await this.notificationService.sendNotification(
+        String(eventData.creator), String(user), ENotificationType.EVENT_MESSAGE,
+        'requested to join your event',
+        { eventId: String(event), navigation: { eventId: String(event) } },
+        'event-join:' + String(saved._id),
+      ).catch(() => undefined);
+    return saved;
   }
 
   async getParticipants(eventId: string) {
@@ -79,7 +87,7 @@ export class EventMembersService {
       userId,
       ENotificationType.EVENT_MESSAGE,
       message,
-      { eventId: eventId, requestStatus: updateEventMemberDto.requestStatus }
+      { eventId: eventId, requestStatus: updateEventMemberDto.requestStatus, navigation: { eventId: String(eventId) } }
     );
 
     return updatedMember;

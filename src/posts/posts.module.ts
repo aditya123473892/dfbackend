@@ -11,9 +11,11 @@ import { Like, LikeSchema } from 'src/common/schemas/like.schema';
 import { Follow, FollowSchema } from 'src/common/schemas/follow.schema';
 import { PostRequest, PostRequestSchema } from 'src/common/schemas/posts-request.schema';
 import { PostBookMark, PostBookMarkSchema } from 'src/common/schemas/posts-bookmark.schema';
+import { NotificationModule } from 'src/notification/notification.module';
 
 @Module({
   imports: [
+    NotificationModule,
     PostRequest,
     MongooseModule.forFeature([
       {

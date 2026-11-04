@@ -3,6 +3,7 @@ import {
   ForbiddenException,
   Injectable,
   NotFoundException,
+  Optional,
 } from '@nestjs/common';
 import { InjectModel } from '@nestjs/mongoose';
 import { Model, SortOrder, Types } from 'mongoose';
@@ -30,6 +31,8 @@ import {
   PostBookMark,
   PostBookMarkDocument,
 } from 'src/common/schemas/posts-bookmark.schema';
+import { NotificationService } from 'src/notification/notification.service';
+import { ENotificationType } from 'src/common/enums/notifications.enum';
 
 interface PostWithCounts extends PostsDocument {
   likeCount: number;
@@ -66,7 +69,16 @@ export class PostsService {
     private PostRequestModel: Model<PostRequestDocument>,
     @InjectModel(PostBookMark.name)
     private PostBookMarkModel: Model<PostBookMarkDocument>,
+    @Optional() private readonly notifications?: NotificationService,
   ) {}
+
+  /** Tells a post's author about activity on it. A failed notification never fails the action. */
+  private notifyAuthor(post: any, actor: string, type: ENotificationType, message: string, dedupeKey: string) {
+    const author = idOf(post.user);
+    if (!this.notifications || author === actor) return;
+    void this.notifications.sendNotification(author, actor, type, message,
+      { navigation: { postId: String(post._id) } }, dedupeKey).catch(() => undefined);
+  }
 
   async create(payload: CreatePostDto) {
     const post = new this.postsModel(payload);
@@ -645,7 +657,7 @@ export class PostsService {
   async createComment(
     dto: CreateCommentDto & { user: string },
   ): Promise<Comment> {
-    await this.commentPost(dto.post, dto.user);
+    const post = await this.commentPost(dto.post, dto.user);
     const content = this.validCommentContent(dto.content);
     // A deterministic ID makes concurrent retries safe without a database migration.
     const id = dto.clientId
@@ -673,6 +685,8 @@ export class PostsService {
       { _id: dto.post },
       { $addToSet: { comments: comment._id } },
     );
+    this.notifyAuthor(post, dto.user, ENotificationType.POST_COMMENT,
+      'commented on your post', 'comment:' + String(comment._id));
     return comment.populate('user', 'displayname firstName lastName avatar');
   }
 
@@ -746,6 +760,9 @@ export class PostsService {
     const post = await this.commentPost(postId, userId);
     try {
       await this.likeModel.create({ post: post._id, user: userId });
+      // One notification per liker and post, so unliking and liking again does not repeat it.
+      this.notifyAuthor(post, userId, ENotificationType.POST_LIKE,
+        'liked your post', 'like:' + String(post._id) + ':' + userId);
     } catch (error) {
       if (error?.code !== 11000) throw error;
     }

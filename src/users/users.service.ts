@@ -624,6 +624,10 @@ export class UsersService {
       await this.notifications.sendNotification(followingId, followerId, ENotificationType.FOLLOW_REQUEST,
         'New follow request', { navigation: { profileId: followerId, requestId: String(saved._id) } },
         'follow:' + saved._id + ':' + (saved.requestKey || 'legacy'), session);
+    else if (saved.status === FollowStatus.ACCEPTED && this.notifications)
+      await this.notifications.sendNotification(followingId, followerId, ENotificationType.NEW_FOLLOWER,
+        'started following you', { navigation: { profileId: followerId } },
+        'follower:' + saved._id + ':' + (saved.requestKey || 'legacy'), session);
     return saved;
   }
 
