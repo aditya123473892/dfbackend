@@ -24,6 +24,8 @@ export const LIVE_WINDOW_MS = 10 * 60_000;
 
 export type SessionMode = 'ai' | 'staff';
 export type StoredMessage = {
+  /** Member message answered by this AI reply, also used to exclude refused exchanges from context. */
+  replyTo?: string;
   id: string;
   /** 'event' rows are notices (staff joined/left) and are never sent to the model. */
   role: 'user' | 'assistant' | 'event';
@@ -162,7 +164,7 @@ export class GodChatSessionsService implements OnModuleInit {
     const now = new Date();
     const flagged = flagUpdate(flags, now);
     const reply: StoredMessage = {
-      id: new Types.ObjectId().toHexString(), role: 'assistant', by: 'ai', content, at: now,
+      id: new Types.ObjectId().toHexString(), role: 'assistant', by: 'ai', content, at: now, replyTo,
       ...(flags.length ? { flags } : {}),
     };
     await this.sessions.updateOne(

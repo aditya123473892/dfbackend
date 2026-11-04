@@ -8,9 +8,9 @@
  * Stored on the message and the session (admins only), so staff can find chats that need a person.
  * 'injection' and 'unsafe' messages are answered with a fixed reply and never reach the model.
  */
-export type GuardFlag = 'self_harm' | 'unsafe' | 'injection' | 'sensitive_data' | 'output_blocked';
+export type GuardFlag = 'self_harm' | 'unsafe' | 'injection' | 'sensitive_data' | 'output_blocked' | 'off_topic';
 /** Messages with these flags are left out of the model's context in later turns too. */
-export const EXCLUDED_FROM_CONTEXT: readonly GuardFlag[] = ['unsafe', 'injection'];
+export const EXCLUDED_FROM_CONTEXT: readonly GuardFlag[] = ['unsafe', 'injection', 'off_topic', 'output_blocked'];
 
 export type InputCheck = {
   /** The text to store and send on, with secrets removed. */
@@ -27,12 +27,14 @@ export const SELF_HARM_REPLY =
   'You can also talk to a crisis line: 988 in the US and Canada, 116 123 (Samaritans) in the UK and Ireland, or find one near you at findahelpline.com. ' +
   'I have flagged this chat so a member of the DARKFANTASY team can check in with you here.';
 export const INJECTION_REPLY =
-  'I cannot change or reveal my instructions, but we can explore what you are feeling or hoping for. What would you like to talk about?';
+  'I cannot change or reveal my instructions. We can explore adult fantasies, desires, intimacy, consent and sexual wellbeing. What would you like to explore?';
+export const OFF_TOPIC_REPLY =
+  'I am here for adult fantasies, desires, sex life, intimacy and sexual wellbeing. What would you like to explore about your desires, consent or boundaries?';
 export const UNSAFE_REPLY =
   'I cannot help with harming or exploiting anyone. We can talk about the feelings behind this and safer choices that respect consent and boundaries. If someone is in immediate danger, contact local emergency services.';
 /** Sent when a model reply fails the output checks. */
 export const FALLBACK_REPLY =
-  'Let us take a step back. We can talk about your feelings, wishes and boundaries without getting graphic. What would you like to understand about them?';
+  'We can explore adult fantasies, desires, intimacy and sexual wellbeing without getting graphic. What would you like to understand about your desires or boundaries?';
 
 const SELF_HARM = [
   /\b(?:kill(?:ing)?|hurt(?:ing)?|harm(?:ing)?|cut(?:ting)?)\s+my\s?self\b/i,
@@ -165,6 +167,7 @@ export function checkOutput(reply: string, maxChars: number, extraHosts: string[
     .slice(0, maxChars);
   const blocked =
     !content ||
+    UNSAFE.some((pattern) => pattern.test(reply)) ||
     PROMPT_MARKERS.some((marker) => content.toLowerCase().includes(marker.toLowerCase())) ||
     asksForSecret(content) ||
     CLAIMS_HUMAN.test(content) ||

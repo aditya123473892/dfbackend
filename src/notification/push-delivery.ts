@@ -1,4 +1,4 @@
-import { Injectable, OnModuleInit } from '@nestjs/common';
+import { Injectable, Logger, OnModuleInit } from '@nestjs/common';
 import { InjectConnection } from '@nestjs/mongoose';
 import { Interval } from '@nestjs/schedule';
 import { Connection, Types } from 'mongoose';
@@ -11,6 +11,7 @@ export const validPushToken = (value: unknown): value is string =>
 /** Durable per-device outbox, leased across API processes. Never puts message content into pushes. */
 @Injectable()
 export class PushDelivery implements OnModuleInit {
+  private readonly logger = new Logger(PushDelivery.name);
   private running = false;
   constructor(@InjectConnection() private readonly db: Connection, private readonly blocks: BlockService) {}
   private get tokens() { return this.db.db.collection<any>('PushTokens'); }
@@ -42,9 +43,17 @@ export class PushDelivery implements OnModuleInit {
     this.running = true;
     try {
       const notifications = this.db.db.collection<any>('Notifications');
-      const rows = await notifications.find({ pushQueued: false }).sort({ _id: 1 }).limit(50).toArray();
+      // Do not consume notifications before a phone has registered. Restrict the query to
+      // reachable owners so accounts without devices cannot starve the first worker page.
+      const owners = (await this.tokens.distinct('owner')).filter((id: unknown) => typeof id === 'string' && Types.ObjectId.isValid(id));
+      const rows = await notifications.find({ pushQueued: false,
+        receiver: { $in: owners.map(id => new Types.ObjectId(id)) },
+        isRead: { $ne: true }, createdAt: { $gte: new Date(Date.now() - 24 * 60 * 60_000) },
+      }).sort({ _id: 1 }).limit(50).toArray();
       for (const row of rows) {
-        for (const device of await this.tokens.find({ owner: String(row.receiver) }).limit(20).toArray()) {
+        const devices = await this.tokens.find({ owner: String(row.receiver) }).limit(20).toArray();
+        if (!devices.length) continue;
+        for (const device of devices) {
           await this.jobs.updateOne({ _id: `${row._id}:${device._id}` }, { $setOnInsert: {
             owner: String(row.receiver), sender: row.sender ? String(row.sender) : null,
             device: device._id, token: device.token, notificationId: String(row._id),
@@ -78,19 +87,23 @@ export class PushDelivery implements OnModuleInit {
               await this.tokens.deleteOne({ _id: job.device, owner: job.owner, token: job.token });
               await this.jobs.updateOne({ _id: job._id }, { $set: { state: 'invalid' } }); continue;
             }
+            this.logger.warn({ event: 'push_provider_rejected', code: String(result.details?.error || 'unknown').slice(0, 64) });
             throw new Error('Push delivery failed');
           }
           if (result.status !== 'ok') throw new Error('Push delivery failed');
           await this.jobs.updateOne({ _id: job._id }, { $set: job.state === 'receipt'
             ? { state: 'delivered' } : { state: 'receipt', ticket: result.id, nextAttempt: new Date(Date.now()+900000) } });
-        } catch {
+        } catch (error) {
+          this.logger.warn({ event: 'push_delivery_retry', type: (error as Error)?.name, attempt: job.attempts + 1 });
           await this.jobs.updateOne({ _id: job._id }, { $inc: { attempts: 1 }, $set: {
             state: job.attempts >= 7 ? 'failed' : job.state,
             nextAttempt: new Date(Date.now()+Math.min(3600000, 30000 * 2 ** job.attempts)),
           } });
         }
       }
-    } catch { /* Persistence remains intact; the next worker tick retries. */ }
+    } catch (error) {
+      this.logger.warn({ event: 'push_worker_retry', type: (error as Error)?.name });
+    }
     finally { this.running = false; }
   }
 }

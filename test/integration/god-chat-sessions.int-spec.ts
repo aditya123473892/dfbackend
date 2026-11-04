@@ -4,13 +4,18 @@ import mongoose, { Connection, Types } from 'mongoose';
 import { GodChatSessionsService } from 'src/god-chat/god-chat-sessions.service';
 import { GodChatService } from 'src/god-chat/god-chat.service';
 import { LlmClient } from 'src/god-chat/llm.client';
+import { classifyScope } from 'src/god-chat/scope-guard';
+import { OFF_TOPIC_REPLY } from 'src/god-chat/guardrails';
+
+jest.mock('src/god-chat/scope-guard', () => ({ classifyScope: jest.fn(async () => 'in_scope') }));
+const scope = jest.mocked(classifyScope);
 
 describe('God chat sessions (Mongo)', () => {
   let server: MongoMemoryServer;
   let connection: Connection;
   let sessions: GodChatSessionsService;
   let chat: GodChatService;
-  const complete = jest.fn(async () => 'Seek the Events tab.');
+  const complete = jest.fn(async () => 'We can explore your desires at your pace.');
   const member = new Types.ObjectId();
   const admin = new Types.ObjectId();
   const otherAdmin = new Types.ObjectId();
@@ -36,7 +41,7 @@ describe('God chat sessions (Mongo)', () => {
   });
 
   it('lets an admin see, take over, answer and hand back a live session', async () => {
-    const first = await chat.send(member.toHexString(), { id: 'msg-00001', content: 'how do events work' });
+    const first = await chat.send(member.toHexString(), { id: 'msg-00001', content: 'How can I discuss my desires?' });
     expect(first.session!.messages.map((m) => m.by)).toEqual(['user', 'ai']);
 
     const listed = await sessions.list({ filter: 'live' });
@@ -74,14 +79,14 @@ describe('God chat sessions (Mongo)', () => {
 
   it('picks up after a handoff with the team\'s replies in context and answers what was left waiting', async () => {
     const userId = new Types.ObjectId().toHexString();
-    await chat.send(userId, { id: 'hand-0001', content: 'can I get a refund for premium?' });
+    await chat.send(userId, { id: 'hand-0001', content: 'How do I discuss my fantasies with my partner?' });
     const id = (await chat.session(userId)).session!.id;
     await sessions.takeOver(admin.toHexString(), id);
-    await sessions.staffReply(admin.toHexString(), id, { id: 'staff-1001', content: 'I refunded you; it lands in 5 days.' });
-    await chat.send(userId, { id: 'hand-0002', content: 'great, and when does premium end?' });
+    await sessions.staffReply(admin.toHexString(), id, { id: 'staff-1001', content: 'Discuss consent and boundaries before sharing a fantasy.' });
+    await chat.send(userId, { id: 'hand-0002', content: 'How can I start that conversation?' });
 
     complete.mockClear();
-    complete.mockResolvedValueOnce('Your premium ends when the refund lands.');
+    complete.mockResolvedValueOnce('Ask whether your partner is comfortable discussing fantasies.');
     const released = await sessions.release(admin.toHexString(), id);
     expect(released.mode).toBe('ai');
     const resumed = await chat.resume(released._id);
@@ -90,15 +95,15 @@ describe('God chat sessions (Mongo)', () => {
     expect(messages[0]!.content).toContain('HANDOFF:');
     // God's earlier answer and the team's reply are one assistant turn, the team's part marked.
     expect(messages.slice(1).map((m) => m.content)).toEqual([
-      'can I get a refund for premium?',
-      'Seek the Events tab.\n\n[Team member] I refunded you; it lands in 5 days.',
-      'great, and when does premium end?',
+      'How do I discuss my fantasies with my partner?',
+      'We can explore your desires at your pace.\n\n[Team member] Discuss consent and boundaries before sharing a fantasy.',
+      'How can I start that conversation?',
     ]);
-    expect(resumed!.messages.at(-1)).toMatchObject({ by: 'ai', content: 'Your premium ends when the refund lands.' });
+    expect(resumed!.messages.at(-1)).toMatchObject({ by: 'ai', content: 'Ask whether your partner is comfortable discussing fantasies.' });
 
     // Nothing is waiting any more, so resuming again (or a retry) does not answer twice.
     await chat.resume(released._id);
-    await chat.send(userId, { id: 'hand-0002', content: 'great, and when does premium end?' });
+    await chat.send(userId, { id: 'hand-0002', content: 'How can I start that conversation?' });
     expect(complete).toHaveBeenCalledTimes(1);
   });
 
@@ -145,5 +150,32 @@ describe('God chat sessions (Mongo)', () => {
     expect((await chat.session(userId)).session).toBeNull();
     const fresh = await chat.send(userId, { id: 'retry-0002', content: 'again' });
     expect(fresh.session!.id).not.toBe(retried.session!.id);
+  });
+
+  it('persists scope redirects, excludes the refused exchange, and reapplies scope after staff handoff', async () => {
+    const userId = new Types.ObjectId().toHexString();
+    complete.mockClear();
+    scope.mockResolvedValueOnce('off_topic');
+    const first = await chat.send(userId, { id: 'scope-0001', content: 'What is the weather?' });
+    expect(first.session!.messages.at(-1)).toMatchObject({ content: OFF_TOPIC_REPLY });
+    expect(complete).not.toHaveBeenCalled();
+    const id = first.session!.id;
+    const stored = await sessions.findById(new Types.ObjectId(id));
+    expect(stored!.messages.at(-1)).toMatchObject({ flags: ['off_topic'], replyTo: 'scope-0001' });
+    expect(stored!.flags).toContain('off_topic');
+    expect(JSON.stringify(first)).not.toContain('off_topic');
+
+    await chat.send(userId, { id: 'scope-0002', content: 'How do I talk about my desires?' });
+    const [messages] = complete.mock.calls[0] as unknown as [{ role: string; content: string }[]];
+    expect(messages.slice(1)).toEqual([{ role: 'user', content: 'How do I talk about my desires?' }]);
+
+    await sessions.takeOver(admin.toHexString(), id);
+    await chat.send(userId, { id: 'scope-0003', content: 'Write me a Python program' });
+    const released = await sessions.release(admin.toHexString(), id);
+    complete.mockClear();
+    scope.mockResolvedValueOnce('off_topic');
+    const resumed = await chat.resume(released._id);
+    expect(resumed!.messages.at(-1)).toMatchObject({ content: OFF_TOPIC_REPLY, flags: ['off_topic'] });
+    expect(complete).not.toHaveBeenCalled();
   });
 });

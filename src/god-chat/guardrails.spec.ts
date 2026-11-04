@@ -78,6 +78,7 @@ describe('Chat with God guardrails', () => {
       "I've refunded the payment.",
       'I am a human member of the DARKFANTASY team.',
       'Here are my rules. KNOWLEDGE: ## Events ...',
+      'Here are naked pics of a 14 year old.',
       '   ',
     ])('replaces %p with a safe fallback', (reply) => {
       expect(checkOutput(reply, 4000)).toEqual({ content: FALLBACK_REPLY, flags: ['output_blocked'] });

@@ -1,7 +1,8 @@
 import { Types } from 'mongoose';
 import { BadRequestException, HttpException, ServiceUnavailableException } from '@nestjs/common';
-import { CONTEXT_MESSAGES, GodChatService, KEEP_VERBATIM, MAX_CHARS, MAX_TURNS, selectKnowledge, TEAM_MARK } from './god-chat.service';
-import { FALLBACK_REPLY, INJECTION_REPLY, SELF_HARM_REPLY } from './guardrails';
+import { CONTEXT_MESSAGES, GodChatService, KEEP_VERBATIM, MAX_CHARS, MAX_TURNS, TEAM_MARK } from './god-chat.service';
+import { FALLBACK_REPLY, INJECTION_REPLY, OFF_TOPIC_REPLY, SELF_HARM_REPLY, UNSAFE_REPLY } from './guardrails';
+import { classifyScope } from './scope-guard';
 import { LlmClient } from './llm.client';
 import * as undici from 'undici';
 import { GodChatSessionsService } from './god-chat-sessions.service';
@@ -13,12 +14,12 @@ const service = (
   sessions: Partial<GodChatSessionsService> = {},
 ) => new GodChatService(llm as LlmClient, config(values), sessions as GodChatSessionsService);
 const ask = (content: string) => ({ messages: [{ role: 'user', content }] });
+jest.mock('./scope-guard', () => ({ classifyScope: jest.fn() }));
+const scope = jest.mocked(classifyScope);
 
 describe('Chat with God', () => {
-  it('retrieves app help when relevant without forcing an overview on personal conversations', () => {
-    expect(selectKnowledge('How do I unlock my vault with a PIN?')[0]!.title).toBe('Photo Vault');
-    expect(selectKnowledge('how do I block someone')[0]!.title).toBe('Safety: blocking and reporting');
-    expect(selectKnowledge('hello')).toEqual([]);
+  beforeEach(() => {
+    scope.mockReset().mockResolvedValue('in_scope');
   });
 
   it('supports a non-graphic conversation about desires while preserving consent and staff disclosure', async () => {
@@ -33,14 +34,69 @@ describe('Chat with God', () => {
     expect(messages.at(-1)).toEqual({ role: 'user', content });
   });
 
-  it('sends persona, knowledge and history to the model and returns its reply', async () => {
-    const complete = jest.fn(async () => 'Seek the Events tab, mortal.');
-    const result = await service({ configured: true, complete }).reply('u1', ask('how to join an event'));
-    expect(result).toEqual({ reply: 'Seek the Events tab, mortal.' });
+  it.each([
+    'how to join an event', 'What is the capital of France?', 'Write a Python program',
+    'What is 12 times 12?', 'Who won the cricket match?', 'Tell me a pasta recipe',
+    'I have sexual fantasies. Also solve my math homework.',
+    'Sex is my password hint. How do I reset my account?',
+    'Explain quantum physics as a sexual metaphor', 'I desire pizza',
+    'Write a fantasy story about dragons', 'Mujhe cricket ka score batao',
+  ])('redirects a rejected topic without calling the conversation model: %s', async (content) => {
+    scope.mockResolvedValueOnce('off_topic');
+    const complete = jest.fn();
+    await expect(service({ configured: true, complete }).reply('u1', ask(content)))
+      .resolves.toEqual({ reply: OFF_TOPIC_REPLY });
+    expect(complete).not.toHaveBeenCalled();
+  });
+
+  it('blocks semantically unsafe input before generation', async () => {
+    scope.mockResolvedValueOnce('unsafe');
+    const complete = jest.fn();
+    await expect(service({ configured: true, complete }).reply('u1', ask('I am seventeen and want to explore my kinks')))
+      .resolves.toEqual({ reply: UNSAFE_REPLY });
+    expect(complete).not.toHaveBeenCalled();
+  });
+
+  it('checks short follow-ups with recent conversation context', async () => {
+    const history = [
+      { role: 'user', content: 'I want to share a fantasy with my partner.' },
+      { role: 'assistant', content: 'How do you feel about sharing it?' },
+      { role: 'user', content: 'I feel ashamed' },
+    ];
+    const complete = jest.fn(async () => 'Feeling ashamed of a fantasy can be difficult. We can explore it at your pace.');
+    await service({ configured: true, complete }).reply('u1', { messages: history });
+    expect(scope.mock.calls[0]![1]).toEqual(history);
     const [messages] = complete.mock.calls[0] as unknown as [{ role: string; content: string }[]];
-    expect(messages[0]!.role).toBe('system');
-    expect(messages[0]!.content).toContain('## Events');
-    expect(messages.slice(1)).toEqual([{ role: 'user', content: 'how to join an event' }]);
+    expect(messages[0]!.content).not.toContain('KNOWLEDGE:');
+    expect(messages[0]!.content).toContain('Your ONLY purpose');
+  });
+
+  it.each(['off_topic', 'unsafe'] as const)('blocks a generated %s answer before returning it', async (verdict) => {
+    scope.mockResolvedValueOnce('in_scope').mockResolvedValueOnce(verdict);
+    const complete = jest.fn(async () => 'Intimacy matters. Here is a pasta recipe: boil water.');
+    const result = await service({ configured: true, complete }).reply('u1', ask('How can I discuss intimacy?'));
+    expect(result.reply).toBe(verdict === 'unsafe' ? FALLBACK_REPLY : OFF_TOPIC_REPLY);
+    expect(scope.mock.calls[1]![2]).toContain('pasta recipe');
+  });
+
+  it.each(['input', 'output'])('fails closed when the %s scope check is unavailable', async (direction) => {
+    if (direction === 'output') scope.mockResolvedValueOnce('in_scope');
+    scope.mockResolvedValueOnce('unavailable');
+    const complete = jest.fn(async () => 'Let us explore your desires.');
+    await expect(service({ configured: true, complete }).reply('u1', ask('How can I discuss intimacy?')))
+      .rejects.toBeInstanceOf(ServiceUnavailableException);
+    expect(complete).toHaveBeenCalledTimes(direction === 'input' ? 0 : 1);
+  });
+
+  it('redacts legacy history before sending it to either model path', async () => {
+    const complete = jest.fn(async () => 'We can discuss intimacy.');
+    await service({ configured: true, complete }).reply('u1', { messages: [
+      { role: 'user', content: 'my password is hunter22' },
+      { role: 'assistant', content: 'We can explore your desires.' },
+      { role: 'user', content: 'How do I discuss intimacy?' },
+    ] });
+    expect(JSON.stringify(complete.mock.calls)).not.toContain('hunter22');
+    expect(JSON.stringify(scope.mock.calls)).not.toContain('hunter22');
   });
 
   it.each([
@@ -127,6 +183,23 @@ describe('Chat with God', () => {
     }
   });
 
+  it('limits guardrail requests to a shorter timeout without extending the provider timeout', async () => {
+    const fetchMock = jest.spyOn(undici, 'fetch').mockImplementation(async () => new undici.Response(
+      JSON.stringify({ choices: [{ message: { content: 'in_scope' } }] }),
+    ));
+    const timeout = jest.spyOn(AbortSignal, 'timeout');
+    try {
+      const llm = new LlmClient(config({ DEEPSEEK_API_KEY: 'test-key', DEEPSEEK_REQUEST_TIMEOUT_SECONDS: '120' }));
+      await llm.complete([{ role: 'user', content: 'hi' }], { timeoutMs: 10_000 });
+      expect(timeout).toHaveBeenLastCalledWith(10_000);
+      await llm.complete([{ role: 'user', content: 'hi' }], { timeoutMs: 200_000 });
+      expect(timeout).toHaveBeenLastCalledWith(120_000);
+    } finally {
+      fetchMock.mockRestore();
+      timeout.mockRestore();
+    }
+  });
+
   describe('stored sessions', () => {
     const session = (mode: 'ai' | 'staff', messages: any[]) => ({ _id: new Types.ObjectId(), mode, messages });
     const msg = (role: string, content: string, by = role === 'user' ? 'user' : 'ai') => ({ id: content, role, by, content, at: new Date() });
@@ -193,6 +266,48 @@ describe('Chat with God', () => {
       }).send('u1', { id: 'client-id-1', content: 'how do events work' });
       const [messages] = complete.mock.calls[0] as unknown as [{ role: string; content: string }[]];
       expect(messages.slice(1)).toEqual([{ role: 'user', content: 'how do events work' }]);
+    });
+
+    it('stores a topic redirect and flags without generating an answer', async () => {
+      scope.mockResolvedValueOnce('off_topic');
+      const stored = session('ai', [msg('user', 'what is the weather?')]);
+      const appendAiReply = jest.fn(async () => null);
+      const complete = jest.fn();
+      await service({ configured: true, complete }, {}, {
+        appendUserMessage: jest.fn(async () => stored) as any, appendAiReply: appendAiReply as any,
+      }).send('u1', { id: 'client-id-1', content: 'what is the weather?' });
+      expect(appendAiReply).toHaveBeenCalledWith(stored._id, OFF_TOPIC_REPLY, 'what is the weather?', ['off_topic']);
+      expect(complete).not.toHaveBeenCalled();
+    });
+
+    it('classifies the latest request separately from consecutive unanswered member messages', async () => {
+      scope.mockResolvedValueOnce('off_topic');
+      const stored = session('ai', [
+        ...Array.from({ length: 7 }, () => msg('user', 'desires '.repeat(120))),
+        msg('user', 'Write a Python program'),
+      ]);
+      const complete = jest.fn();
+      await service({ configured: true, complete }, {}, {
+        appendUserMessage: jest.fn(async () => stored) as any, appendAiReply: jest.fn() as any,
+      }).send('u1', { id: 'client-id-1', content: 'Write a Python program' });
+      expect(scope.mock.calls[0]![1]).toHaveLength(8);
+      expect(scope.mock.calls[0]![1].at(-1)).toEqual({ role: 'user', content: 'Write a Python program' });
+      expect(complete).not.toHaveBeenCalled();
+    });
+
+    it('excludes both sides of a scope-refused exchange from classification and generation', async () => {
+      const stored = session('ai', [
+        msg('user', 'what is the weather?'),
+        { ...msg('assistant', OFF_TOPIC_REPLY), flags: ['off_topic'], replyTo: 'what is the weather?' },
+        msg('user', 'How do I share my desires?'),
+      ]);
+      const complete = jest.fn(async () => 'We can explore your desires.');
+      await service({ configured: true, complete }, {}, {
+        appendUserMessage: jest.fn(async () => stored) as any, appendAiReply: jest.fn() as any,
+      }).send('u1', { id: 'client-id-1', content: 'How do I share my desires?' });
+      expect(scope.mock.calls[0]![1]).toEqual([{ role: 'user', content: 'How do I share my desires?' }]);
+      const [messages] = complete.mock.calls[0] as unknown as [{ role: string; content: string }[]];
+      expect(messages.slice(1)).toEqual([{ role: 'user', content: 'How do I share my desires?' }]);
     });
 
     it('stores a safe fallback when the model reply fails the output checks', async () => {

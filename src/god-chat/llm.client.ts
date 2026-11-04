@@ -3,7 +3,7 @@ import { ConfigService } from '@nestjs/config';
 import { Agent, fetch } from 'undici';
 
 export type LlmMessage = { role: 'system' | 'user' | 'assistant'; content: string };
-export type LlmOptions = { temperature?: number; maxTokens?: number };
+export type LlmOptions = { temperature?: number; maxTokens?: number; timeoutMs?: number };
 
 const DEFAULT_BASE_URL = 'https://api.deepseek.com';
 const DEFAULT_MODEL = 'deepseek-v4-flash';
@@ -32,7 +32,10 @@ export class LlmClient {
     const baseUrl = (this.config.get<string>('DEEPSEEK_BASE_URL')?.trim() || DEFAULT_BASE_URL).replace(/\/$/, '');
     const model = this.config.get<string>('DEEPSEEK_MODEL')?.trim() || DEFAULT_MODEL;
 
-    const timeoutMs = this.positiveInteger('DEEPSEEK_REQUEST_TIMEOUT_SECONDS', 120) * 1000;
+    const configuredTimeoutMs = this.positiveInteger('DEEPSEEK_REQUEST_TIMEOUT_SECONDS', 120) * 1000;
+    const timeoutMs = options.timeoutMs && options.timeoutMs > 0
+      ? Math.min(options.timeoutMs, configuredTimeoutMs)
+      : configuredTimeoutMs;
     const dispatcher = new Agent({
       connect: { timeout: this.positiveInteger('DEEPSEEK_CONNECT_TIMEOUT_SECONDS', 10) * 1000 },
       headersTimeout: timeoutMs,

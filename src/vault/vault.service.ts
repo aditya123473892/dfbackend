@@ -161,7 +161,8 @@ export class VaultService implements OnModuleInit {
     await this.photos.enqueue([key], new Date(Date.now() + 600000), true);
     await this.photos.assertActiveAccount(owner);
     await this.storage.copyVideo(row.tempKey, key, row.contentType, row.etag);
-    const fields = { state: 'approved', status: 'approved', ownerId: owner, resourceType: 'vault', resourceId: row.serverPhotoId || row.id,
+    await this.storage.verifyEncryptedBackup(key, row.size);
+    const fields = { remoteEncrypted: true, state: 'approved', status: 'approved', ownerId: owner, resourceType: 'vault', resourceId: row.serverPhotoId || row.id,
       key, s3Key: key, sha256: `md5:${row.md5}`, size: row.size, contentType: row.contentType };
     const commit = await this.rows.updateOne({ _id: row._id, state: 'scanning' }, { $set: fields, $unset: { jobId: '' } });
     if (!commit.modifiedCount) throw new ConflictException('Photo changed');

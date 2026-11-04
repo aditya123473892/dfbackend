@@ -1,6 +1,6 @@
 /**
- * Knowledge base for Chat with God. Each entry is one topic; the service sends only
- * the entries that best match the user's question. Edit freely: plain text, no secrets.
+ * Legacy app knowledge retained for reference. Talk to God no longer retrieves these
+ * entries: app support is outside its adult intimacy scope.
  * Kept as TypeScript (not .md) so `nest build` always ships it inside dist.
  */
 export type KnowledgeEntry = { title: string; keywords: string[]; content: string };
@@ -10,7 +10,7 @@ export const KNOWLEDGE: KnowledgeEntry[] = [
     title: 'Chat with God',
     keywords: ['god', 'companion', 'fantasies', 'desires', 'feelings', 'consent', 'boundaries', 'sex', 'intimacy', 'libido', 'wellbeing'],
     content:
-      'Chat with God is an AI companion for nonjudgmental, non-graphic conversations about fantasies, desires, sex life, sexual wellbeing, intimacy, relationships and emotions. Members choose what to share and can explore feelings, communicate with a partner and discuss consensual boundaries at their own pace. The AI can also help with app questions. Conversations are saved; DARKFANTASY staff can read them and join as a clearly identified team member. Past chats are available from the history button.',
+      'Chat with God is an AI companion for nonjudgmental, non-graphic conversations about adult fantasies, desires, sex life, sexual wellbeing, intimacy and related emotions. Members choose what to share and can explore feelings, communicate with a partner and discuss consensual boundaries at their own pace. Unrelated questions and app support are redirected. Conversations are saved; DARKFANTASY staff can read them and join as a clearly identified team member. Past chats are available from the history button.',
   },
   {
     title: 'About DARKFANTASY',

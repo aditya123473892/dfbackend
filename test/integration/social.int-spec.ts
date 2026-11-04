@@ -210,6 +210,39 @@ describe('Social relationship persistence and following-first feed', () => {
     expect(after.payloadBytes).toBeLessThan(before.payloadBytes);
   });
 
+  it('keeps recent notifications pending until a device registers without starving other recipients', async () => {
+    const [sender, waiting, reachable] = await h.users(3);
+    const push = new PushDelivery(h.connection, h.blocks);
+    await push.onModuleInit();
+    await h.connection.db.collection('PushTokens').deleteMany({});
+    await h.connection.db.collection('PushDeliveries').deleteMany({});
+    const first = await notifications.sendNotification(waiting, sender, 'direct_message' as any, 'New message');
+    await push.flush();
+    expect(await h.models.Notification.findById(first._id).lean()).toMatchObject({ pushQueued: false });
+    // More than a worker page of accounts without tokens must not block a registered phone.
+    for (let i = 0; i < 55; i++) await notifications.sendNotification(waiting, sender, 'direct_message' as any, 'New message');
+    await push.register(reachable, 'ExponentPushToken[reachable-device-token-12345]');
+    await notifications.sendNotification(reachable, sender, 'direct_message' as any, 'New message');
+    const original = global.fetch;
+    const transport = jest.fn(async () => ({ ok: true, json: async () => ({ data: [{ status: 'ok', id: 'ticket' }] }) }));
+    try {
+      global.fetch = transport as any;
+      await push.flush();
+      expect(transport).toHaveBeenCalledTimes(1);
+      expect(await h.connection.db.collection('PushDeliveries').findOne({ owner: reachable })).toMatchObject({ state: 'receipt' });
+      await push.register(waiting, 'ExponentPushToken[late-device-token-12345]');
+      await push.flush();
+      expect(await h.models.Notification.findById(first._id).lean()).toMatchObject({ pushQueued: true });
+      expect(await h.connection.db.collection('PushDeliveries').findOne({ notificationId: String(first._id) })).toMatchObject({ owner: waiting });
+      await push.flush();
+      expect(await h.connection.db.collection('PushDeliveries').countDocuments({ notificationId: String(first._id) })).toBe(1);
+    } finally {
+      global.fetch = original;
+      await h.connection.db.collection('PushTokens').deleteMany({});
+      await h.connection.db.collection('PushDeliveries').deleteMany({});
+    }
+  });
+
   it('push retries preserve notifications, enforce token ownership, deduplicate jobs and remove invalid devices', async () => {
     const [a,b] = await h.users(2);
     const push = new PushDelivery(h.connection,h.blocks);
