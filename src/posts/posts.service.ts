@@ -58,6 +58,13 @@ const MAX_FEED_OFFSET = 1000;
 const SORTABLE_FIELDS = ['createdAt', 'updatedAt', '_id'];
 const AUTHOR_FIELDS = 'displayname avatar';
 
+/** A comment as clients see it: a like count and the viewer's own state, never the likers. */
+function commentView(comment: any, viewer?: string) {
+  const { likes, ...rest } = comment ?? {};
+  const ids: string[] = (likes ?? []).map((id: unknown) => String(id));
+  return { ...rest, likeCount: ids.length, likedByMe: viewer ? ids.includes(viewer) : false };
+}
+
 @Injectable()
 export class PostsService {
   constructor(
@@ -438,10 +445,11 @@ export class PostsService {
       userId,
       status: true,
     })
+      .sort({ _id: -1 })
       .populate({
         path: 'postId',
         populate: [
-          { path: 'user', select: '_id displayname' },
+          { path: 'user', select: '_id displayname avatar' },
           { path: 'likes', select: 'user', populate: { path: 'user', select: AUTHOR_FIELDS } },
           { path: 'comments', select: 'content user', populate: { path: 'user', select: AUTHOR_FIELDS } }
         ]
@@ -482,8 +490,15 @@ export class PostsService {
     return enhancedBookMarks.filter(Boolean);
   }
 
-  async updatePostBookMarkStatus(userId: string, postId: string) {
+  /** With `saved`, sets that state (safe to retry); without it, flips (older clients). */
+  async updatePostBookMarkStatus(userId: string, postId: string, saved?: boolean) {
     await this.commentPost(postId, userId);
+    if (typeof saved === 'boolean')
+      return this.PostBookMarkModel.findOneAndUpdate(
+        { userId, postId },
+        { $set: { status: saved } },
+        { upsert: true, new: true },
+      );
 
     const existingBookmark = await this.PostBookMarkModel.findOne({
       userId,
@@ -648,7 +663,7 @@ export class PostsService {
       this.commentModel.countDocuments({ post: postId }),
     ]);
     return {
-      comments: comments.slice(0, limit),
+      comments: comments.slice(0, limit).map((comment) => commentView(comment, userId)),
       hasMore: comments.length > limit,
       count,
     };
@@ -706,7 +721,7 @@ export class PostsService {
       { new: true },
     );
     if (!comment) throw new NotFoundException('Comment not found');
-    return this.toClientComment(comment);
+    return this.toClientComment(comment, userId);
   }
 
   async deleteComment(
@@ -841,11 +856,55 @@ export class PostsService {
     return content;
   }
 
-  private async toClientComment(comment: any) {
+  private async toClientComment(comment: any, viewer?: string) {
     if (comment?.populate && !comment.user?.displayname) {
       await comment.populate({ path: 'user', select: AUTHOR_FIELDS });
     }
-    return comment?.toObject ? comment.toObject() : { ...comment };
+    return commentView(comment?.toObject ? comment.toObject() : { ...comment }, viewer);
+  }
+
+  /** Who liked a visible post, newest first; people blocked either way are left out. */
+  async listLikers(postId: string, viewer: string, params: { before?: string; limit?: number }) {
+    const post = await this.commentPost(postId, viewer);
+    const excluded = await blockedIds(this.postsModel.db, viewer);
+    const filter: any = {
+      post: post._id,
+      ...(excluded.length
+        ? { user: { $nin: excluded.map((id) => new Types.ObjectId(id)) } }
+        : {}),
+    };
+    if (params.before) {
+      if (!Types.ObjectId.isValid(params.before)) throw new BadRequestException('Invalid cursor');
+      filter._id = { $lt: new Types.ObjectId(params.before) };
+    }
+    const limit = Math.min(50, Math.max(1, Number(params.limit) || 30));
+    const rows: any[] = await this.likeModel
+      .find(filter)
+      .sort({ _id: -1 })
+      .limit(limit + 1)
+      .populate('user', '_id displayname avatar')
+      .lean();
+    const page = rows.slice(0, limit);
+    return {
+      users: page.filter((row) => row.user).map((row) => row.user),
+      nextCursor: rows.length > limit ? String(page[page.length - 1]._id) : undefined,
+    };
+  }
+
+  /** Idempotent: liking twice leaves one like, unliking twice leaves none. */
+  async setCommentLiked(postId: string, commentId: string, userId: string, liked: boolean) {
+    await this.commentPost(postId, userId);
+    if (!Types.ObjectId.isValid(commentId)) throw new NotFoundException('Comment not found');
+    const user = new Types.ObjectId(userId);
+    const comment: any = await this.commentModel
+      .findOneAndUpdate(
+        { _id: commentId, post: postId },
+        liked ? { $addToSet: { likes: user } } : { $pull: { likes: user } },
+        { new: true, projection: { likes: 1 } },
+      )
+      .lean();
+    if (!comment) throw new NotFoundException('Comment not found');
+    return { commentId, liked, likeCount: comment.likes?.length ?? 0 };
   }
 }
 

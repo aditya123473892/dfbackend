@@ -27,6 +27,10 @@ export class Comment {
   // Client-generated idempotency key, unique per author.
   @Prop({ required: false })
   clientId?: string;
+
+  // Who liked the comment. Never returned: clients get a count and their own state.
+  @Prop({ type: [{ type: mongoose.Schema.Types.ObjectId, ref: 'Users' }], default: [] })
+  likes?: mongoose.Types.ObjectId[];
 }
 
 export const CommentSchema = SchemaFactory.createForClass(Comment);

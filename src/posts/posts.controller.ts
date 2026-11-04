@@ -326,11 +326,13 @@ export class PostsController {
   async updatePostBookMarkStatus(
     @Param('postId') postId: string,
     @AuthUser() authUser: IAuthUser,
+    @Body() body?: { saved?: unknown },
   ) {
     try {
       const updatedBookMark = await this.postsService.updatePostBookMarkStatus(
         authUser.id,
         postId,
+        typeof body?.saved === 'boolean' ? body.saved : undefined,
       );
       return successRes(
         { updatedBookMark },
@@ -456,6 +458,41 @@ export class PostsController {
     } else {
       return badRequestRes('Failed to delete the comment');
     }
+  }
+
+  @ApiBearerAuth()
+  @UseGuards(JwtAuthGuard)
+  @Get(':postId/likes')
+  @ApiOperation({ summary: 'People who liked a visible post, newest first' })
+  async listLikers(
+    @Param('postId') postId: string,
+    @Query('before') before: string | undefined,
+    @Query('limit') limit: string | undefined,
+    @AuthUser() user: IAuthUser,
+  ) {
+    return successRes(
+      await this.postsService.listLikers(postId, user.id, {
+        before,
+        limit: Number(limit) || undefined,
+      }),
+    );
+  }
+
+  @ApiBearerAuth()
+  @UseGuards(JwtAuthGuard)
+  @Put(':postId/comment/:commentId/like')
+  @ApiOperation({ summary: 'Set whether the viewer likes a comment (idempotent)' })
+  async likeComment(
+    @Param('postId') postId: string,
+    @Param('commentId') commentId: string,
+    @Body() body: { liked?: unknown },
+    @AuthUser() user: IAuthUser,
+  ) {
+    if (typeof body?.liked !== 'boolean')
+      throw new BadRequestException('liked must be true or false');
+    return successRes(
+      await this.postsService.setCommentLiked(postId, commentId, user.id, body.liked),
+    );
   }
 
   @ApiBearerAuth()

@@ -108,7 +108,11 @@ describe('Post comments contract', () => {
       before: String(cursor._id),
     });
     expect(result).toEqual({
-      comments: [{ _id: 'a' }, { _id: 'b' }],
+      // Likers are never exposed: only a count and the viewer's own state.
+      comments: [
+        { _id: 'a', likeCount: 0, likedByMe: false },
+        { _id: 'b', likeCount: 0, likedByMe: false },
+      ],
       hasMore: true,
       count: 3,
     });

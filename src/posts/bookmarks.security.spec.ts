@@ -10,7 +10,7 @@ describe('Bookmark visibility', () => {
     const populated: any = { ...post, user: { _id: owner }, likes: [], comments: [] };
     populated.toObject = () => ({ ...populated });
     const bookmarks: any = {
-      find: jest.fn().mockReturnValue({ populate: async () => [{ postId: populated }] }),
+      find: jest.fn().mockReturnValue({ sort() { return this; }, populate: async () => [{ postId: populated }] }),
       findOne: jest.fn().mockResolvedValue({ status: false, save: jest.fn().mockResolvedValue({ status: true }) }),
     };
     const posts: any = { findById: jest.fn(async () => post),
