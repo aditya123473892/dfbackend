@@ -24,6 +24,7 @@ import {
 } from 'src/common/interceptors/response.handlers';
 import { ChatService } from './chats.service';
 import {
+  ChatHistoryQueryDto,
   ChatMediaQueryDto,
   CreateChatMessageDto,
   UpdateChatMediaExpiryDto,
@@ -54,13 +55,15 @@ export class ChatsController {
   @Get('messages')
   async history(
     @AuthUser() user: IAuthUser,
-    @Query(new ValidationPipe({ whitelist: true, forbidNonWhitelisted: true })) query: ChatMediaQueryDto,
+    @Query(new ValidationPipe({ whitelist: true, forbidNonWhitelisted: true })) query: ChatHistoryQueryDto,
   ) {
     if (Boolean(query.receiver) === Boolean(query.groupId))
       throw new BadRequestException('Choose one conversation');
+    // Without a limit the full history is returned, as before, for older clients.
+    const page = query.limit ? { limit: Number(query.limit), before: query.before } : {};
     const messages = query.groupId
-      ? await this.chatService.getChatGroupHistory(user.id, query.groupId)
-      : await this.chatService.getChatHistory(user.id, query.receiver);
+      ? await this.chatService.getChatGroupHistory(user.id, query.groupId, page)
+      : await this.chatService.getChatHistory(user.id, query.receiver, page);
     return successGetRes(messages);
   }
 

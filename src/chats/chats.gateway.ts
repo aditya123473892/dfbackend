@@ -433,14 +433,14 @@ export class ChatGateway
     if (message.groupId) {
       // Deliver to current members, never to a stale subscription. Recheck each
       // member immediately before emission; removals cannot keep receiving data.
-      for (const id of await this.blocks.groupMembers(
-        String(message.groupId),
-      )) {
+      // Members are checked together: one at a time made delivery slower per member.
+      const members = await this.blocks.groupMembers(String(message.groupId));
+      await Promise.all(members.map(async (id) => {
         try {
           await this.chatService.assertGroupMember(id, String(message.groupId));
         } catch {
           this.server.in(`user:${id}`).socketsLeave(`group:${message.groupId}`);
-          continue;
+          return;
         }
         const blockedSender = await this.blocks.isBlockedEitherWay(
           senderId,
@@ -454,7 +454,7 @@ export class ChatGateway
             ...(blockedSender ? { message: '', media: [] } : {}),
             blockedSender,
           });
-      }
+      }));
       return;
     }
     const receiverId = String(message.receiver?._id || message.receiver);

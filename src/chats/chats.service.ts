@@ -146,9 +146,11 @@ export class ChatService {
 
   private async notifyMessage(message: any) {
     if (this.notifications && message.receiver && !message.groupId) {
-      await this.notifications.sendNotification(String(message.receiver), String(message.sender),
+      // The send must not wait for the notification write; the dedupe key keeps retries single.
+      void this.notifications.sendNotification(String(message.receiver), String(message.sender),
         ENotificationType.DIRECT_MESSAGE, 'New direct message',
-        { navigation: { conversationId: 'user:' + String(message.sender) } }, 'message:' + String(message._id));
+        { navigation: { conversationId: 'user:' + String(message.sender) } }, 'message:' + String(message._id))
+        .catch(() => undefined);
     }
     return this.toClientMessage(message);
   }
@@ -296,8 +298,11 @@ export class ChatService {
     uploaded.forEach((media) => (media.expiresAt = expiresAt));
     let saved: any;
     try {
-      if (dto.groupId) await this.assertGroupMember(actorId, dto.groupId);
-      else await this.assertCanSendDirect(actorId, dto.receiver);
+      // Binding photos can take a while; recheck access after it. Text was just checked.
+      if (ids.length) {
+        if (dto.groupId) await this.assertGroupMember(actorId, dto.groupId);
+        else await this.assertCanSendDirect(actorId, dto.receiver);
+      }
       saved = await new this.chatMessageModel({
         _id: id,
         sender: actorId,

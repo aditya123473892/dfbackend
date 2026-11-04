@@ -8,6 +8,7 @@ import {
   ArrayUnique,
   IsUUID,
   IsMongoId,
+  IsNumberString,
   IsOptional,
   IsString,
   Matches,
@@ -67,6 +68,17 @@ export class ChatMediaQueryDto {
   @IsOptional()
   @IsMongoId()
   groupId?: string;
+}
+
+/** Optional paging for HTTP history, matching the socket history requests. */
+export class ChatHistoryQueryDto extends ChatMediaQueryDto {
+  @IsOptional()
+  @IsNumberString({ no_symbols: true })
+  limit?: string;
+
+  @IsOptional()
+  @IsMongoId()
+  before?: string;
 }
 
 export class UpdateChatMediaExpiryDto {

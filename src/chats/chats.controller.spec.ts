@@ -11,14 +11,20 @@ describe('Chat HTTP history fallback', () => {
   it('loads direct history with the authenticated viewer, not a client sender', async () => {
     service.getChatHistory.mockResolvedValue([{ _id: 'message' }]);
     const result = await controller.history({ id: 'viewer' } as never, { receiver: 'peer' });
-    expect(service.getChatHistory).toHaveBeenCalledWith('viewer', 'peer');
+    expect(service.getChatHistory).toHaveBeenCalledWith('viewer', 'peer', {});
     expect(result.data).toEqual([{ _id: 'message' }]);
   });
 
   it('loads groups through the existing membership check', async () => {
     service.getChatGroupHistory.mockResolvedValue([]);
     expect((await controller.history({ id: 'viewer' } as never, { groupId: 'group' })).data).toEqual([]);
-    expect(service.getChatGroupHistory).toHaveBeenCalledWith('viewer', 'group');
+    expect(service.getChatGroupHistory).toHaveBeenCalledWith('viewer', 'group', {});
+  });
+
+  it('passes a requested page through to the history query', async () => {
+    service.getChatHistory.mockResolvedValue([]);
+    await controller.history({ id: 'viewer' } as never, { receiver: 'peer', limit: '50', before: 'cursor' });
+    expect(service.getChatHistory).toHaveBeenCalledWith('viewer', 'peer', { limit: 50, before: 'cursor' });
   });
 
   it.each([{}, { receiver: 'peer', groupId: 'group' }])('rejects an ambiguous target %j', async (query) => {
