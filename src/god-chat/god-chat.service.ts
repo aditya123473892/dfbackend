@@ -4,8 +4,11 @@ import {
   HttpStatus,
   Injectable,
   Logger,
+  Optional,
   ServiceUnavailableException,
 } from '@nestjs/common';
+import { randomUUID } from 'crypto';
+import { GodChatQuotaService } from './god-chat-quota.service';
 import { ConfigService } from '@nestjs/config';
 import { Types } from 'mongoose';
 import { z } from 'zod';
@@ -127,7 +130,13 @@ export class GodChatService {
     private readonly llm: LlmClient,
     private readonly config: ConfigService,
     private readonly sessions: GodChatSessionsService,
+    @Optional() private readonly quota?: GodChatQuotaService,
   ) {}
+
+  /** Today's free-message allowance; null when no quota is configured (tests). */
+  quotaStatus(userId: string) {
+    return this.quota ? this.quota.status(userId) : Promise.resolve(null);
+  }
 
   session(userId: string) {
     return this.sessions.findOpen(userId).then(memberView);
@@ -155,10 +164,13 @@ export class GodChatService {
     const parsed = sendInput.safeParse(body);
     if (!parsed.success) throw new BadRequestException('Invalid chat request');
     this.rateLimit(userId);
+    // Free messages count only toward the AI; writing to a team member who took over is free.
+    if (this.quota && (await this.sessions.findOpen(userId))?.mode !== 'staff')
+      await this.quota.consume(userId, parsed.data.id);
     const guard = checkInput(parsed.data.content);
     if (guard.flags.length) this.logger.warn({ event: 'god_chat_input_flagged', flags: guard.flags });
     const session = await this.sessions.appendUserMessage(userId, parsed.data.id, guard.content, guard.flags);
-    return memberView(await this.answer(session));
+    return { ...memberView(await this.answer(session)), quota: await this.quotaStatus(userId) };
   }
 
   /** Hands the session back to the AI, which then answers anything the member wrote after the team's last reply. */
@@ -186,6 +198,7 @@ export class GodChatService {
     const last = history[history.length - 1]!;
     if (last.role !== 'user') throw new BadRequestException('The last message must come from the user');
     this.rateLimit(userId);
+    if (this.quota) await this.quota.consume(userId, `legacy-${randomUUID()}`);
     const guard = checkInput(last.content);
     if (guard.reply) return { reply: guard.reply };
     if (!this.llm.configured) throw new ServiceUnavailableException('Chat with God is not configured');

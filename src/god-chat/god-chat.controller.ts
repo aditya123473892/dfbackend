@@ -22,8 +22,8 @@ export class GodChatController {
   /** Lets the app show "unavailable" before the user types anything. */
   @Get('status')
   @Header('Cache-Control', 'private, no-store')
-  status() {
-    return successGetRes({ available: this.llm.configured });
+  async status(@AuthUser() actor: IAuthUser) {
+    return successGetRes({ available: this.llm.configured, quota: await this.godChat.quotaStatus(actor.id) });
   }
 
   /** The member's open conversation (or null), polled so admin replies show up. */

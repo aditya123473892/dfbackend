@@ -10,7 +10,7 @@ export class Users {
   // Existing accounts required approval for every follow. Preserve that default.
   @Prop({ type: Boolean, required: false })
   isPrivate: boolean;
-  // Written exclusively by verified server entitlement processing (never a user DTO).
+  // Written only by server entitlement processing or an audited admin grant (never a user DTO).
   @Prop({ type: Date, default: null, select: false })
   premiumUntil?: Date;
 

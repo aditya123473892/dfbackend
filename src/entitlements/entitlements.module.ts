@@ -1,8 +1,10 @@
-import { Controller, Get, Injectable, Module, ServiceUnavailableException, UseGuards } from '@nestjs/common';
+import { Body, Controller, Get, Injectable, Module, Param, Patch, Query, ServiceUnavailableException, UseGuards } from '@nestjs/common';
 import { InjectConnection } from '@nestjs/mongoose';
 import { Connection, Types } from 'mongoose';
-import { AuthUser } from '../common/decorators';
-import { JwtAuthGuard } from '../common/guards';
+import { AuthUser, Roles } from '../common/decorators';
+import { ERole } from '../common/enums';
+import { JwtAuthGuard, RolesGuard } from '../common/guards';
+import { AdminPremiumService, memberListInput, parseMemberInput, premiumChangeInput } from './admin-premium.service';
 import { IAuthUser } from '../common/interfaces';
 import { successRes } from '../common/interceptors';
 import { isPremium } from '../posts/post.mapper';
@@ -45,5 +47,24 @@ export class EntitlementsController {
   }
 }
 
-@Module({ providers: [EntitlementsService, DisabledEntitlementVerifier], controllers: [EntitlementsController] })
+/** Admins move members between normal and premium (manual grants; no payment involved). */
+@Controller('admin/users')
+@UseGuards(JwtAuthGuard, RolesGuard)
+@Roles(ERole.ADMIN)
+export class AdminPremiumController {
+  constructor(private readonly premium: AdminPremiumService) {}
+  @Get()
+  async list(@Query() query: Record<string, unknown>) {
+    return successRes(await this.premium.list(parseMemberInput(memberListInput, query)));
+  }
+  @Patch(':id/premium')
+  async setPremium(@AuthUser() actor: IAuthUser, @Param('id') id: string, @Body() body: unknown) {
+    return successRes({ user: await this.premium.setPremium(actor.id, id, parseMemberInput(premiumChangeInput, body)) });
+  }
+}
+
+@Module({
+  providers: [EntitlementsService, DisabledEntitlementVerifier, AdminPremiumService],
+  controllers: [EntitlementsController, AdminPremiumController],
+})
 export class EntitlementsModule {}
