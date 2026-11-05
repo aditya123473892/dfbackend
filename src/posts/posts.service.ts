@@ -79,12 +79,12 @@ export class PostsService {
     @Optional() private readonly notifications?: NotificationService,
   ) {}
 
-  /** Tells a post's author about activity on it. A failed notification never fails the action. */
-  private notifyAuthor(post: any, actor: string, type: ENotificationType, message: string, dedupeKey: string) {
-    const author = idOf(post.user);
-    if (!this.notifications || author === actor) return;
+  /** Notify the affected author and link to the post. Notification failures never fail the action. */
+  private notifyPostActivity(postId: string, recipient: unknown, actor: string, type: ENotificationType, message: string, dedupeKey: string) {
+    const author = idOf(recipient);
+    if (!this.notifications || !Types.ObjectId.isValid(author) || author === actor) return;
     void this.notifications.sendNotification(author, actor, type, message,
-      { navigation: { postId: String(post._id) } }, dedupeKey).catch(() => undefined);
+      { navigation: { postId } }, dedupeKey).catch(() => undefined);
   }
 
   async create(payload: CreatePostDto) {
@@ -700,7 +700,7 @@ export class PostsService {
       { _id: dto.post },
       { $addToSet: { comments: comment._id } },
     );
-    this.notifyAuthor(post, dto.user, ENotificationType.POST_COMMENT,
+    this.notifyPostActivity(String(post._id), post.user, dto.user, ENotificationType.POST_COMMENT,
       'commented on your post', 'comment:' + String(comment._id));
     return comment.populate('user', 'displayname firstName lastName avatar');
   }
@@ -776,7 +776,7 @@ export class PostsService {
     try {
       await this.likeModel.create({ post: post._id, user: userId });
       // One notification per liker and post, so unliking and liking again does not repeat it.
-      this.notifyAuthor(post, userId, ENotificationType.POST_LIKE,
+      this.notifyPostActivity(String(post._id), post.user, userId, ENotificationType.POST_LIKE,
         'liked your post', 'like:' + String(post._id) + ':' + userId);
     } catch (error) {
       if (error?.code !== 11000) throw error;
@@ -900,10 +900,12 @@ export class PostsService {
       .findOneAndUpdate(
         { _id: commentId, post: postId },
         liked ? { $addToSet: { likes: user } } : { $pull: { likes: user } },
-        { new: true, projection: { likes: 1 } },
+        { new: true, projection: { likes: 1, user: 1 } },
       )
       .lean();
     if (!comment) throw new NotFoundException('Comment not found');
+    if (liked) this.notifyPostActivity(postId, comment.user, userId, ENotificationType.COMMENT_LIKE,
+      'liked your comment', `comment-like:${commentId}:${userId}`);
     return { commentId, liked, likeCount: comment.likes?.length ?? 0 };
   }
 }

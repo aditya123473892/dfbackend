@@ -6,6 +6,7 @@ export enum ENotificationType {
   REPORT_RECEIPT = 'report_receipt',
   MODERATION_NOTICE = 'moderation_notice',
   POST_LIKE = 'post_like',
+  COMMENT_LIKE = 'comment_like',
   POST_COMMENT = 'post_comment',
   NEW_FOLLOWER = 'new_follower',
   //   FRIEND_REQUEST = 'friend_request',

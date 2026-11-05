@@ -167,20 +167,78 @@ describe('Social relationship persistence and following-first feed', () => {
     await expect(h.posts.findVisiblePost(String((await h.post(privateUser))._id),viewer)).rejects.toThrow();
   });
 
-  it('persists direct-message notifications independently from push and deduplicates a retried text send', async () => {
+  it('keeps direct-message pushes and message unread counts separate from the bell, including legacy records', async () => {
     const [a,b] = await h.users(2);
     (h.chat as any).notifications = notifications;
     const input = { sender:a,receiver:b,message:'Do not put this text in a push',clientId:'unique-message-123' };
     await h.chat.saveTextMessage(input); await h.chat.saveTextMessage(input);
     const page = await notifications.list(b);
-    expect(page.notifications).toHaveLength(1);
-    expect(page.unreadCount).toBe(1);
-    expect(page.notifications[0]).toMatchObject({ type:'direct_message',message:'New direct message',navigation:{conversationId:'user:'+a} });
+    expect(page.notifications).toHaveLength(0);
+    expect(page.unreadCount).toBe(0);
+    expect(await h.chat.getUnreadMessageCount(b)).toHaveLength(1);
+    expect(await h.chat.getUnreadMessageCount(a)).toHaveLength(0);
+    expect(await h.models.Notification.countDocuments()).toBe(1);
     const row = await h.models.Notification.findOne();
+    expect(row).toMatchObject({ type:'direct_message',message:'New direct message',metadata:{navigation:{conversationId:'user:'+a}} });
     expect(row.pushQueued).toBe(false);
     expect(JSON.stringify(row)).not.toContain(input.message);
     await notifications.markRead(b);
     expect((await notifications.list(b)).unreadCount).toBe(0);
+    expect((await h.models.Notification.findById(row._id)).isRead).toBe(false);
+    expect(await h.chat.getUnreadMessageCount(b)).toHaveLength(1);
+  });
+
+  it('routes post, comment-like and follow activity only to the affected user, with safe links and no duplicate or self notices', async () => {
+    const [postAuthor,commentAuthor,actor,stranger] = await h.users(4, { isPrivate:false });
+    const post = await h.post(postAuthor);
+    const postId = String(post._id);
+    const writes: Promise<unknown>[] = [];
+    const original = notifications.sendNotification.bind(notifications);
+    const sending = jest.spyOn(notifications, 'sendNotification').mockImplementation((...args) => {
+      const write = original(...args); writes.push(write); return write;
+    });
+    (h.posts as any).notifications = notifications;
+    try {
+      await h.posts.likePost(postId,actor);
+      await h.posts.likePost(postId,actor);
+      await h.posts.likePost(postId,postAuthor);
+      const input = { post:postId,user:commentAuthor,content:'A comment',clientId:'notification-comment-123' };
+      const comment: any = await h.posts.createComment(input);
+      await h.posts.createComment(input);
+      const commentId = String(comment._id);
+      await h.posts.setCommentLiked(postId,commentId,actor,true);
+      await h.posts.setCommentLiked(postId,commentId,actor,true);
+      await h.posts.setCommentLiked(postId,commentId,actor,false);
+      await h.posts.setCommentLiked(postId,commentId,actor,true);
+      await h.posts.setCommentLiked(postId,commentId,commentAuthor,true);
+      await users.sendFollowRequest(actor,postAuthor);
+      await h.models.Users.updateOne({ _id:commentAuthor }, { $set:{isPrivate:true} });
+      const request: any = await users.sendFollowRequest(actor,commentAuthor);
+      await users.sendFollowRequest(actor,commentAuthor);
+      await users.approveFollowRequest(String(request._id),FollowStatus.ACCEPTED,commentAuthor);
+      await Promise.all(writes);
+
+      const authorPage = await notifications.list(postAuthor);
+      expect(authorPage.notifications.map(n => n.type).sort()).toEqual(['new_follower','post_comment','post_like']);
+      expect(authorPage.unreadCount).toBe(3);
+      for (const n of authorPage.notifications.filter(n => n.type.startsWith('post_')))
+        expect(n.navigation).toEqual({ postId });
+      const commenterPage = await notifications.list(commentAuthor);
+      expect(commenterPage.notifications.map(n => n.type).sort()).toEqual(['comment_like','follow_request']);
+      expect(commenterPage.notifications.find(n => n.type === 'comment_like').navigation).toEqual({ postId });
+      expect(commenterPage.notifications.find(n => n.type === 'follow_request').navigation).toEqual({ profileId:actor,requestId:String(request._id) });
+      const actorPage = await notifications.list(actor);
+      expect(actorPage.notifications).toHaveLength(1);
+      expect(actorPage.notifications[0]).toMatchObject({ type:'follow_accepted',navigation:{profileId:commentAuthor} });
+      expect((await notifications.list(stranger)).notifications).toHaveLength(0);
+      await notifications.markRead(stranger,authorPage.notifications.map(n => String(n._id)));
+      expect((await notifications.list(postAuthor)).unreadCount).toBe(3);
+      expect(await h.models.Notification.countDocuments()).toBe(6);
+    } finally {
+      await Promise.allSettled(writes);
+      sending.mockRestore();
+      (h.posts as any).notifications = undefined;
+    }
   });
 
   it('measures the original Discover query path against summary reads on the same local dataset', async () => {
@@ -256,7 +314,8 @@ describe('Social relationship persistence and following-first feed', () => {
       const transport=jest.fn().mockRejectedValue(new Error('offline'));
       global.fetch=transport;
       await push.flush();
-      expect((await notifications.list(b)).unreadCount).toBe(1);
+      expect((await notifications.list(b)).unreadCount).toBe(0);
+      expect(await h.models.Notification.countDocuments({ type:'direct_message' })).toBe(1);
       const jobs=h.connection.db.collection<any>('PushDeliveries');
       expect(await jobs.countDocuments()).toBe(1);
       expect(await jobs.findOne()).toMatchObject({state:'pending',attempts:1});
@@ -269,7 +328,8 @@ describe('Social relationship persistence and following-first feed', () => {
       await push.flush();
       expect(await jobs.findOne()).toMatchObject({state:'invalid'});
       expect(await h.connection.db.collection('PushTokens').countDocuments()).toBe(0);
-      expect((await notifications.list(b)).notifications).toHaveLength(1);
+      expect((await notifications.list(b)).notifications).toHaveLength(0);
+      expect(await h.models.Notification.countDocuments({ type:'direct_message' })).toBe(1);
       expect(transport.mock.calls[1][1].body).not.toContain('password');
     } finally {global.fetch=original;await h.connection.db.collection('PushDeliveries').deleteMany({});}
   });

@@ -22,13 +22,16 @@ export class NotificationService {
   ) {}
 
   async list(receiver: string, before?: string) {
-    const filter = { receiver, ...(before ? { _id: { $lt: new Types.ObjectId(before) } } : {}) };
+    // Direct-message records drive phone pushes; the Messages tab owns their unread count.
+    // Filtering before pagination also excludes records created by older API versions.
+    const inbox = { receiver, type: { $ne: ENotificationType.DIRECT_MESSAGE } };
+    const filter = { ...inbox, ...(before ? { _id: { $lt: new Types.ObjectId(before) } } : {}) };
     const [rows, unreadCount] = await Promise.all([
       this.notificationModel.find(filter)
         .sort({ _id: -1 }).limit(21)
         .select('_id type message createdAt isRead sender metadata.eventId metadata.navigation')
         .populate('sender', 'displayname avatar').lean(),
-      this.notificationModel.countDocuments({ receiver, isRead: { $ne: true } }),
+      this.notificationModel.countDocuments({ ...inbox, isRead: { $ne: true } }),
     ]);
     return {
       notifications: rows.slice(0, 20).map((row: any) => ({
@@ -45,7 +48,8 @@ export class NotificationService {
 
   async markRead(receiver: string, ids?: string[]) {
     await this.notificationModel.updateMany(
-      { receiver, ...(ids ? { _id: { $in: ids } } : {}), isRead: { $ne: true } },
+      { receiver, type: { $ne: ENotificationType.DIRECT_MESSAGE },
+        ...(ids ? { _id: { $in: ids } } : {}), isRead: { $ne: true } },
       { $set: { isRead: true } },
     );
     this.changes$.next({ receiver });
@@ -60,6 +64,7 @@ export class NotificationService {
     dedupeKey?: string,
     session?: ClientSession,
   ) {
+    if (sender === receiver) return null;
     if (sender && (await this.blocks.isBlockedEitherWay(sender, receiver)))
       return null;
     const data = {
@@ -86,7 +91,7 @@ export class NotificationService {
     }
 
     // Transactional callers emit only after the relationship and notification both commit.
-    if (!session) this.changes$.next({ receiver });
+    if (!session && type !== ENotificationType.DIRECT_MESSAGE) this.changes$.next({ receiver });
     return notification;
   }
 }
