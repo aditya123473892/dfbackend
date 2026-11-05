@@ -31,6 +31,7 @@ import { UserBlocksModule } from './user-blocks/user-blocks.module';
 import { blockContext, blockQueryPlugin } from './user-blocks/block-context';
 import { ReportsModule } from './reports/reports.module';
 import { GodChatModule } from './god-chat/god-chat.module';
+import { LegalModule } from './legal/legal.controller';
 import { EntitlementsModule } from './entitlements/entitlements.module';
 import { HealthController } from './deployment/health.controller';
 
@@ -80,6 +81,7 @@ import { HealthController } from './deployment/health.controller';
     NotificationModule,
     ContactModule,
     GodChatModule,
+    LegalModule,
     ScheduleModule.forRoot(),
   ],
   controllers: [AppController, HealthController],
