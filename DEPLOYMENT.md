@@ -25,6 +25,49 @@ For a single Caddy proxy, `TRUST_PROXY=1`. Change this to the exact hop count on
 
 ## Build, migrate, start
 
+### Docker server at api.darkfantasy.club (production)
+
+The live API is `https://api.darkfantasy.club/api`. It runs the published image
+`ghcr.io/aditya123473892/dfbackend:3112026` behind Caddy, which obtains and renews the HTTPS
+certificate automatically.
+
+One-time server setup:
+
+1. A Linux server (2 GB RAM or more) with Docker Engine and the Compose plugin. Open ports 80
+   and 443 (TCP and UDP) to the internet. Do not open 9000.
+2. DNS at the darkfantasy.club registrar: an **A record** `api` pointing to the server's public IP
+   (plus AAAA for IPv6). With Cloudflare, use "DNS only" (grey cloud) so Caddy can get the
+   certificate.
+3. Atlas **Network Access**: add the server's public IP.
+4. If the GitHub package is private, sign in once with a token that has `read:packages`:
+   `echo <token> | docker login ghcr.io -u <github-username> --password-stdin`.
+5. Get the code and settings:
+
+   ```sh
+   git clone -b 3112026 https://github.com/aditya123473892/dfbackend.git
+   cd dfbackend
+   cp .env.production.example .env.production
+   chmod 600 .env.production
+   ```
+
+   Fill every blank value: the Atlas password in `DATABASE_URL`, `JWT_SECRET`
+   (`openssl rand -hex 48`), `PASSWORD_ENCRYPTION_PRIVATE_KEY` (`openssl rand -hex 32`), the
+   AWS S3/SES/Rekognition keys, and `DEEPSEEK_API_KEY`. Keep the two secrets the same as the
+   current Render service, or every user is signed out and encrypted links stop working.
+
+Deploy, and later update to the newest image, with one command:
+
+```sh
+git pull && sh deploy/deploy.sh
+```
+
+It pulls the image, runs the index migration, restarts the API and Caddy, and waits until
+`https://api.darkfantasy.club/api/health/ready` answers. Logs:
+`docker compose --env-file .env.production -f deploy/compose.production.yml logs -f backend`.
+
+Only build the Android release (AAB) after that health URL works: the app's API address is
+fixed at build time. Keep the Render service running until users of older app builds update.
+
 ### Render with the Atlas cluster
 
 Use the canonical `dfbackend` repository (or `dfbackend` as Root Directory in the combined workspace). Set the service's production environment values from `.env.production.example`; `deploy/render.env.example` contains the Atlas overlay for `cluster0.by1ww6f.mongodb.net` and database `darkfantasy`.
@@ -37,14 +80,15 @@ In Render's **Connect > Outbound** tab, copy the service's outbound IP ranges in
 
 References: [Render environment variables](https://render.com/docs/configure-environment-variables), [Render outbound addresses](https://render.com/docs/outbound-ip-addresses), [Atlas connection troubleshooting](https://www.mongodb.com/docs/atlas/troubleshoot-connection/).
 
-Run from the backend directory:
+To build on the server instead of pulling the published image, run from the backend directory:
 
 ```sh
 docker compose --env-file .env.production -f deploy/compose.production.yml build
-docker compose --env-file .env.production -f deploy/compose.production.yml run --rm --no-deps backend npm run migrate:deploy
 docker compose --env-file .env.production -f deploy/compose.production.yml up -d
 docker compose --env-file .env.production -f deploy/compose.production.yml ps
 ```
+
+The `migrate` service runs the index migration before the API starts.
 
 The migration creates declared schema indexes plus phone, storage, blocking and reporting indexes. It never drops collections or deletes/merges user data. Run it with an operator database principal allowed to create indexes. It fails on conflicting indexes or incompatible duplicate data; resolve those deliberately, then rerun. Do not remove live indexes to make deployment pass without understanding the violated invariant.
 
