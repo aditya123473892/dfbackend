@@ -1,25 +1,47 @@
+# Only the source, lockfile and build config are needed to build the image.
+# Never send secrets or local data to the Docker build context.
+
+# Dependencies and build output (rebuilt inside Linux)
 node_modules
-npm-debug.log*
 dist
-.git
-.gitignore
-.vscode
-.idea
-*.log
-dev-server*.log
-build*.log
+coverage
+.nyc_output
+
+# Secrets and local environment
 .env
 .env.*
 !.env.example
-run-dev-node18.cmd
-coverage
-.nyc_output
+config.bat
+
+# Local databases, uploads and dumps
+.local-mongo
+mongo_DF
+dump
 uploads
 local
-dump
-mongo_DF
-config.bat
+*.sqlite
+*.sqlite-*
+
+# Tooling, logs and temp files
+.git
+.gitignore
+.github
+.vscode
+.idea
+.tmp
+tmp
+*.log
+npm-debug.log*
+dev-server*.log
+build*.log
+run-dev-node18.cmd
+
+# Docker and deployment files are not part of the image
 Dockerfile
-docker-compose.yml
 .dockerignore
-README.md
+docker-compose*.yml
+deploy
+
+# Tests and docs
+test
+*.md

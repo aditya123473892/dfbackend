@@ -2,6 +2,8 @@
 
 Deployment and mobile integration: see [DEPLOYMENT.md](DEPLOYMENT.md) for the production Docker image, HTTPS proxy, required services, index migration, verification email flow, health checks and private deleted-vault retention.
 
+Docker: see [DOCKER.md](DOCKER.md) to run the published image (or build it) with a bundled MongoDB using `docker compose up -d`, and how to share the image with others.
+
 
 ## 🚀 Setup
 

@@ -1,0 +1,73 @@
+# DARKFANTASY backend: local / shared stack.
+#
+#   cp .env.docker.example .env.docker      (then fill in what you need)
+#   docker compose up -d                     (pulls the published image)
+#   docker compose up -d --build             (builds from this checkout instead)
+#
+# API: http://localhost:9000/api   Swagger: http://localhost:9000/docs
+# Health: http://localhost:9000/api/health/ready
+#
+# MongoDB runs as a single-node replica set because the API uses transactions and change
+# streams. Its data lives in the "mongo_data" volume and survives restarts.
+# For production with Atlas, TLS and Caddy, use deploy/compose.production.yml (DEPLOYMENT.md).
+
+name: darkfantasy
+
+x-backend: &backend
+  image: ${BACKEND_IMAGE:-ghcr.io/aditya123473892/dfbackend:3112026}
+  build:
+    context: .
+    target: runtime
+  # All settings, including the database, come from .env.docker only, never from your .env.
+  env_file:
+    - .env.docker
+  environment:
+    HOST: 0.0.0.0
+    PORT: 9000
+  init: true
+
+services:
+  mongo:
+    image: mongo:7.0
+    command: ["--replSet", "rs0", "--bind_ip_all"]
+    ports:
+      - "127.0.0.1:${MONGO_PORT:-27017}:27017"
+    volumes:
+      - mongo_data:/data/db
+    # Starts the replica set on first boot, then reports healthy once it has a primary.
+    healthcheck:
+      test:
+        - CMD
+        - mongosh
+        - --quiet
+        - --eval
+        - "try { rs.status() } catch (e) { rs.initiate({ _id: 'rs0', members: [{ _id: 0, host: 'mongo:27017' }] }) } quit(db.hello().isWritablePrimary ? 0 : 1)"
+      interval: 5s
+      timeout: 10s
+      retries: 30
+      start_period: 10s
+    restart: unless-stopped
+
+  # Creates the database indexes; safe to run on every start, never deletes data.
+  migrate:
+    <<: *backend
+    command: ["npm", "run", "migrate:deploy"]
+    depends_on:
+      mongo:
+        condition: service_healthy
+    restart: "no"
+
+  backend:
+    <<: *backend
+    ports:
+      - "${API_PORT:-9000}:9000"
+    depends_on:
+      mongo:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    restart: unless-stopped
+    stop_grace_period: 30s
+
+volumes:
+  mongo_data:

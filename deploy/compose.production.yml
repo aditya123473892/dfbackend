@@ -3,7 +3,9 @@ services:
     build:
       context: ..
       target: runtime
-    image: darkfantasy-backend:local
+    # Set BACKEND_IMAGE=ghcr.io/aditya123473892/dfbackend:<tag> to run a published image
+    # (docker compose pull) instead of building on the server.
+    image: ${BACKEND_IMAGE:-darkfantasy-backend:local}
     env_file:
       - ../.env.production
     environment:
