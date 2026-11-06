@@ -1,0 +1,9 @@
+# Docker, Compose and env files are read inside Linux containers: keep LF line endings on
+# every platform so values never pick up a trailing carriage return.
+Dockerfile text eol=lf
+.dockerignore text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+.env* text eol=lf
+*.sh text eol=lf
+deploy/Caddyfile text eol=lf
